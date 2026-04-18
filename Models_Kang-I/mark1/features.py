@@ -45,12 +45,15 @@ def build_features_for_pixels(
         _safe_cosine_similarity(emb_2023, emb_2020),
     ]
 
-    return np.column_stack(
-        raw_features + delta_features + [feature[:, None] for feature in similarity_features]
-    ).astype(np.float32, copy=False)
+    feature_columns = raw_features + delta_features + [feature[:, None] for feature in similarity_features]
+    return np.column_stack(feature_columns).astype(np.float32, copy=False)
 
 
-def build_features_for_locations(embeddings: dict[int, np.ndarray], rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
+def build_features_for_locations(
+    embeddings: dict[int, np.ndarray],
+    rows: np.ndarray,
+    cols: np.ndarray,
+) -> np.ndarray:
     return build_features_for_pixels(
         embeddings[2020][:, rows, cols].T,
         embeddings[2021][:, rows, cols].T,

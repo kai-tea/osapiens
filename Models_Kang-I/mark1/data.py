@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 
@@ -11,6 +12,15 @@ from rasterio.warp import reproject
 
 YEARS = (2020, 2021, 2022, 2023)
 LABEL_SOURCES = ("radd", "gladl", "glads2")
+GLADL_YEARS = (21, 22, 23, 24, 25)
+TARGET_START_DATE = date(2021, 1, 1)
+TARGET_END_DATE = date(2023, 12, 31)
+RADD_REFERENCE_DATE = date(2014, 12, 31)
+GLADS2_REFERENCE_DATE = date(2019, 1, 1)
+RADD_TARGET_START_OFFSET = (TARGET_START_DATE - RADD_REFERENCE_DATE).days
+RADD_TARGET_END_OFFSET = (TARGET_END_DATE - RADD_REFERENCE_DATE).days
+GLADS2_TARGET_START_OFFSET = (TARGET_START_DATE - GLADS2_REFERENCE_DATE).days
+GLADS2_TARGET_END_OFFSET = (TARGET_END_DATE - GLADS2_REFERENCE_DATE).days
 
 
 def parse_tile_and_year(path: Path) -> tuple[str, int]:
@@ -18,8 +28,13 @@ def parse_tile_and_year(path: Path) -> tuple[str, int]:
     return "_".join(parts[:-1]), int(parts[-1])
 
 
-def list_train_tiles(data_root: Path, years: Iterable[int] = YEARS) -> list[str]:
-    embedding_dir = data_root / "aef-embeddings" / "train"
+def list_tiles(data_root: Path, split: str, years: Iterable[int] = YEARS) -> list[str]:
+    """List AEF tiles that contain the required yearly embeddings for a split.
+
+    The downloaded challenge data includes AEF embeddings through 2025, but the
+    Mark 1 baseline intentionally keeps the original 2020-2023 feature window.
+    """
+    embedding_dir = data_root / "aef-embeddings" / split
     required_years = set(years)
     years_by_tile: dict[str, set[int]] = {}
 
@@ -28,6 +43,10 @@ def list_train_tiles(data_root: Path, years: Iterable[int] = YEARS) -> list[str]
         years_by_tile.setdefault(tile_id, set()).add(year)
 
     return sorted(tile_id for tile_id, seen_years in years_by_tile.items() if required_years.issubset(seen_years))
+
+
+def list_train_tiles(data_root: Path, years: Iterable[int] = YEARS) -> list[str]:
+    return list_tiles(data_root, split="train", years=years)
 
 
 def read_raster(path: Path) -> tuple[np.ndarray, dict]:
@@ -65,12 +84,17 @@ def _validate_embedding_meta(meta: dict, tile_id: str, year: int) -> None:
         raise ValueError(f"{tile_id}_{year}: embedding transform is missing")
 
 
-def load_embeddings(data_root: Path, tile_id: str, years: Iterable[int] = YEARS) -> tuple[dict[int, np.ndarray], dict]:
+def load_embeddings(
+    data_root: Path,
+    tile_id: str,
+    split: str = "train",
+    years: Iterable[int] = YEARS,
+) -> tuple[dict[int, np.ndarray], dict]:
     embeddings: dict[int, np.ndarray] = {}
     reference_meta = None
 
     for year in years:
-        path = data_root / "aef-embeddings" / "train" / f"{tile_id}_{year}.tiff"
+        path = data_root / "aef-embeddings" / split / f"{tile_id}_{year}.tiff"
         array, meta = read_raster(path)
         _validate_embedding_meta(meta, tile_id, year)
 
@@ -141,6 +165,96 @@ def load_weak_labels(data_root: Path, tile_id: str, reference_meta: dict) -> dic
     return {"radd": radd, "gladl": gladl, "glads2": glads2}
 
 
+def load_label_evidence(data_root: Path, tile_id: str, reference_meta: dict) -> dict[str, np.ndarray]:
+    labels_root = data_root / "labels" / "train"
+    height = reference_meta["height"]
+    width = reference_meta["width"]
+
+    def empty_bool() -> np.ndarray:
+        return np.zeros((height, width), dtype=bool)
+
+    strong_positive = empty_bool()
+    weak_positive = empty_bool()
+    future_alert = empty_bool()
+    prior_alert = empty_bool()
+    uncertain_alert = empty_bool()
+    any_alert = empty_bool()
+    strong_source_count = np.zeros((height, width), dtype=np.uint8)
+    weak_source_count = np.zeros((height, width), dtype=np.uint8)
+
+    # RADD: leading digit is confidence, remaining digits are days since 2014-12-31.
+    radd_raw, radd_meta = read_single_band(labels_root / "radd" / f"radd_{tile_id}_labels.tif")
+    radd = np.rint(reproject_to_match(radd_raw, radd_meta, reference_meta)).astype(np.int32, copy=False)
+    radd_confidence = radd // 10_000
+    radd_offset = radd % 10_000
+    radd_has_alert = radd > 0
+    any_alert |= radd_has_alert
+    radd_strong = (radd_confidence == 3) & radd_has_alert & (radd_offset >= RADD_TARGET_START_OFFSET) & (radd_offset <= RADD_TARGET_END_OFFSET)
+    radd_weak = (radd_confidence == 2) & radd_has_alert & (radd_offset >= RADD_TARGET_START_OFFSET) & (radd_offset <= RADD_TARGET_END_OFFSET)
+    strong_positive |= radd_strong
+    weak_positive |= radd_weak
+    strong_source_count += radd_strong.astype(np.uint8)
+    weak_source_count += radd_weak.astype(np.uint8)
+    prior_alert |= radd_has_alert & (radd_offset < RADD_TARGET_START_OFFSET)
+    future_alert |= radd_has_alert & (radd_offset > RADD_TARGET_END_OFFSET)
+
+    # GLAD-S2: confidence stored in alert.tif, date in days since 2019-01-01 in alertDate.tif.
+    glads2_alert_path = labels_root / "glads2" / f"glads2_{tile_id}_alert.tif"
+    glads2_date_path = labels_root / "glads2" / f"glads2_{tile_id}_alertDate.tif"
+    if glads2_alert_path.exists() and glads2_date_path.exists():
+        glads2_alert_raw, glads2_alert_meta = read_single_band(glads2_alert_path)
+        glads2_date_raw, glads2_date_meta = read_single_band(glads2_date_path)
+        glads2_alert = np.rint(reproject_to_match(glads2_alert_raw, glads2_alert_meta, reference_meta)).astype(np.int16, copy=False)
+        glads2_date = np.rint(reproject_to_match(glads2_date_raw, glads2_date_meta, reference_meta)).astype(np.int32, copy=False)
+        glads2_has_alert = glads2_alert > 0
+        glads2_in_target = (glads2_date >= GLADS2_TARGET_START_OFFSET) & (glads2_date <= GLADS2_TARGET_END_OFFSET)
+        any_alert |= glads2_has_alert
+        glads2_strong = glads2_has_alert & glads2_in_target & (glads2_alert >= 3)
+        glads2_weak = glads2_has_alert & glads2_in_target & (glads2_alert == 2)
+        strong_positive |= glads2_strong
+        weak_positive |= glads2_weak
+        strong_source_count += glads2_strong.astype(np.uint8)
+        weak_source_count += glads2_weak.astype(np.uint8)
+        uncertain_alert |= glads2_has_alert & ((glads2_alert == 1) | ((glads2_alert == 2) & ~glads2_in_target))
+        prior_alert |= glads2_has_alert & (glads2_date < GLADS2_TARGET_START_OFFSET)
+        future_alert |= glads2_has_alert & (glads2_date > GLADS2_TARGET_END_OFFSET)
+
+    # GLAD-L: yearly alert rasters with 2=probable, 3=confirmed.
+    for year_suffix in GLADL_YEARS:
+        alert_path = labels_root / "gladl" / f"gladl_{tile_id}_alert{year_suffix}.tif"
+        date_path = labels_root / "gladl" / f"gladl_{tile_id}_alertDate{year_suffix}.tif"
+        if not alert_path.exists() or not date_path.exists():
+            continue
+
+        alert_raw, alert_meta = read_single_band(alert_path)
+        alert = np.rint(reproject_to_match(alert_raw, alert_meta, reference_meta)).astype(np.int16, copy=False)
+        has_alert = alert > 0
+        any_alert |= has_alert
+        full_year = 2000 + year_suffix
+        if 2021 <= full_year <= 2023:
+            gladl_strong = has_alert & (alert == 3)
+            gladl_weak = has_alert & (alert == 2)
+            strong_positive |= gladl_strong
+            weak_positive |= gladl_weak
+            strong_source_count += gladl_strong.astype(np.uint8)
+            weak_source_count += gladl_weak.astype(np.uint8)
+        elif full_year < 2021:
+            prior_alert |= has_alert
+        else:
+            future_alert |= has_alert
+
+    return {
+        "strong_positive": strong_positive,
+        "weak_positive": weak_positive,
+        "strong_source_count": strong_source_count,
+        "weak_source_count": weak_source_count,
+        "prior_alert": prior_alert,
+        "future_alert": future_alert,
+        "uncertain_alert": uncertain_alert,
+        "any_alert": any_alert,
+    }
+
+
 def remove_tiny_blobs(mask: np.ndarray, min_blob_size: int = 4) -> np.ndarray:
     height, width = mask.shape
     visited = np.zeros_like(mask, dtype=bool)
@@ -180,19 +294,60 @@ def fuse_labels(
     valid_mask: np.ndarray,
     apply_blob_filter: bool = False,
     min_blob_size: int = 4,
-) -> tuple[np.ndarray, np.ndarray]:
+    positive_min_votes: int = 2,
+    negative_max_votes: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     votes = np.stack([weak_labels[name].astype(np.uint8) for name in LABEL_SOURCES], axis=0).sum(axis=0)
 
-    positive_mask = votes >= 2
+    positive_mask = votes >= positive_min_votes
     if apply_blob_filter:
         positive_mask = remove_tiny_blobs(positive_mask, min_blob_size=min_blob_size)
 
     fused_labels = np.full(votes.shape, -1, dtype=np.int8)
-    fused_labels[valid_mask & (votes == 0)] = 0
+    sample_weights = np.zeros(votes.shape, dtype=np.float32)
+    fused_labels[valid_mask & (votes <= negative_max_votes)] = 0
     fused_labels[valid_mask & positive_mask] = 1
+    sample_weights[fused_labels == 0] = 1.0
+    sample_weights[fused_labels == 1] = 1.0
     train_mask = fused_labels >= 0
 
-    return fused_labels, train_mask
+    return fused_labels, train_mask, sample_weights
+
+
+def fuse_labels_confidence_date(
+    label_evidence: dict[str, np.ndarray],
+    valid_mask: np.ndarray,
+    apply_blob_filter: bool = False,
+    min_blob_size: int = 4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    strong_positive = label_evidence["strong_positive"]
+    weak_positive = label_evidence["weak_positive"]
+    strong_source_count = label_evidence["strong_source_count"].astype(np.float32, copy=False)
+    weak_source_count = label_evidence["weak_source_count"].astype(np.float32, copy=False)
+    prior_alert = label_evidence["prior_alert"]
+    future_alert = label_evidence["future_alert"]
+    uncertain_alert = label_evidence["uncertain_alert"]
+    any_alert = label_evidence["any_alert"]
+
+    positive_score = strong_source_count + 0.5 * weak_source_count
+    conflict_mask = prior_alert | future_alert
+    positive_mask = valid_mask & ~conflict_mask & ((strong_positive) | (positive_score >= 1.5))
+    if apply_blob_filter:
+        positive_mask = remove_tiny_blobs(positive_mask, min_blob_size=min_blob_size)
+
+    negative_mask = valid_mask & ~any_alert & ~conflict_mask & ~uncertain_alert
+    fused_labels = np.full(valid_mask.shape, -1, dtype=np.int8)
+    sample_weights = np.zeros(valid_mask.shape, dtype=np.float32)
+
+    fused_labels[negative_mask] = 0
+    sample_weights[negative_mask] = 1.0
+
+    fused_labels[positive_mask] = 1
+    positive_weights = np.clip(0.5 + 0.2 * strong_source_count + 0.1 * weak_source_count, 0.6, 1.0)
+    sample_weights[positive_mask] = positive_weights[positive_mask]
+
+    train_mask = fused_labels >= 0
+    return fused_labels, train_mask, sample_weights
 
 
 def sample_training_tile(
@@ -202,16 +357,32 @@ def sample_training_tile(
     min_blob_size: int = 4,
     max_samples_per_tile: int | None = None,
     random_seed: int = 42,
+    positive_min_votes: int = 2,
+    negative_max_votes: int = 0,
+    label_policy: str = "legacy_vote",
 ) -> dict:
     embeddings, embedding_meta = load_embeddings(data_root, tile_id)
     valid_mask = build_valid_mask(embeddings)
-    weak_labels = load_weak_labels(data_root, tile_id, embedding_meta)
-    fused_labels, train_mask = fuse_labels(
-        weak_labels,
-        valid_mask,
-        apply_blob_filter=apply_blob_filter,
-        min_blob_size=min_blob_size,
-    )
+    if label_policy == "legacy_vote":
+        weak_labels = load_weak_labels(data_root, tile_id, embedding_meta)
+        fused_labels, train_mask, sample_weights = fuse_labels(
+            weak_labels,
+            valid_mask,
+            apply_blob_filter=apply_blob_filter,
+            min_blob_size=min_blob_size,
+            positive_min_votes=positive_min_votes,
+            negative_max_votes=negative_max_votes,
+        )
+    elif label_policy == "confidence_date":
+        label_evidence = load_label_evidence(data_root, tile_id, embedding_meta)
+        fused_labels, train_mask, sample_weights = fuse_labels_confidence_date(
+            label_evidence,
+            valid_mask,
+            apply_blob_filter=apply_blob_filter,
+            min_blob_size=min_blob_size,
+        )
+    else:
+        raise ValueError(f"Unsupported label_policy: {label_policy}")
 
     rows, cols = np.where(train_mask)
     if max_samples_per_tile is not None and rows.size > max_samples_per_tile:
@@ -228,6 +399,7 @@ def sample_training_tile(
         "rows": rows.astype(np.int32),
         "cols": cols.astype(np.int32),
         "labels": fused_labels[rows, cols].astype(np.int8),
+        "sample_weights": sample_weights[rows, cols].astype(np.float32),
     }
 
 
