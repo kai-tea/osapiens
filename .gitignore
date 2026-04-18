@@ -1,3 +1,6 @@
+
+# tomy
+
 # Python
 __pycache__/
 *.py[cod]
@@ -26,3 +29,9 @@ splits/
 # Logs
 *.log
 .claude/
+
+
+
+#cini
+*.pyc
+artifacts/
