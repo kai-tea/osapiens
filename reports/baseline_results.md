@@ -1,6 +1,6 @@
 # Baseline v1 — cross-validation results
 
-- Git SHA: `574448a349c8cc83355773e42ad851dba5359f7e`
+- Git SHA: `0f31a530cf5ec5c3bec4d0c5dcf0ffef48a6859f`
 - Split source: `cini/splits/split_v1/fold_assignments.csv`
 - Positive threshold (training target): soft_target >= 0.5
 - Classifier: LightGBM binary, 402 features
@@ -9,60 +9,73 @@
 
 | fold | threshold | precision | recall | F1 | IoU | PR-AUC | rows | positives |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 0.580 | 0.816 | 0.902 | 0.857 | 0.749 | 0.950 | 20000 | 10000 |
-| 1 | 0.266 | 0.900 | 0.835 | 0.866 | 0.764 | 0.954 | 20000 | 10000 |
-| 2 | 0.174 | 0.906 | 0.906 | 0.906 | 0.829 | 0.968 | 20000 | 10000 |
-| **mean** |  | 0.874 | 0.881 | 0.876 | 0.781 | 0.957 |  |  |
+| 0 | 0.326 | 0.966 | 0.980 | 0.973 | 0.948 | 0.992 | 311985 | 248091 |
+| 1 | 0.315 | 0.956 | 0.956 | 0.956 | 0.916 | 0.988 | 500000 | 240139 |
+| 2 | 0.663 | 0.971 | 0.978 | 0.974 | 0.950 | 0.996 | 406902 | 214243 |
+| **mean** |  | 0.964 | 0.971 | 0.968 | 0.938 | 0.992 |  |  |
 
 ### Submission threshold summary
 
-- mean: 0.340
-- median: 0.266
-- min: 0.174
-- max: 0.580
+- mean: 0.435
+- median: 0.326
+- min: 0.315
+- max: 0.663
 
 ## Per-MGRS region breakdown
 
 | region | mean F1 across folds | total rows |
 | --- | ---: | ---: |
-| 18NWJ | 0.906 | 20000 |
-| 18NWH | 0.866 | 20000 |
-| 18NWG | 0.857 | 20000 |
+| 48PWV | 0.998 | 100000 |
+| 48QWD | 0.993 | 100000 |
+| 48PYB | 0.993 | 100000 |
+| 48PXC | 0.993 | 100000 |
+| 48QVE | 0.986 | 100000 |
+| 47QQV | 0.985 | 10877 |
+| 48PUT | 0.977 | 100000 |
+| 47QMB | 0.954 | 6902 |
+| 18NWG | 0.873 | 100000 |
+| 18NXH | 0.858 | 100000 |
+| 19NBD | 0.814 | 100000 |
+| 18NWJ | 0.684 | 100000 |
+| 18NWH | 0.587 | 100000 |
+| 18NXJ | 0.561 | 100000 |
+| 18NWM | 0.000 | 1092 |
+| 18NYH | 0.000 | 16 |
 
-**Regional generalisation gap (best − worst F1)**: 18NWJ (0.906) − 18NWG (0.857) = **0.050**
+**Regional generalisation gap (best − worst F1)**: 48PWV (0.998) − 18NWM (0.000) = **0.998**
 
 ## Confusion matrices per fold (at F1-optimal threshold)
 
 | fold | TN | FP | FN | TP |
 | --- | ---: | ---: | ---: | ---: |
-| 0 | 7966 | 2034 | 984 | 9016 |
-| 1 | 9077 | 923 | 1652 | 8348 |
-| 2 | 9064 | 936 | 936 | 9064 |
+| 0 | 55367 | 8527 | 4874 | 243217 |
+| 1 | 249409 | 10452 | 10619 | 229520 |
+| 2 | 186325 | 6334 | 4662 | 209581 |
 
 ## Top-20 feature importances (total gain across folds)
 
 | rank | feature | gain |
 | --- | --- | ---: |
-| 1 | `aef_e60_delta` | 151,146.2 |
-| 2 | `aef_e20_delta` | 53,138.4 |
-| 3 | `aef_e02_delta` | 16,215.1 |
-| 4 | `aef_e36_baseline` | 15,431.8 |
-| 5 | `aef_e36_delta` | 14,884.4 |
-| 6 | `aef_e00_delta` | 8,401.9 |
-| 7 | `aef_e05_delta` | 7,994.7 |
-| 8 | `aef_e22_delta` | 6,343.9 |
-| 9 | `aef_e35_delta` | 3,624.2 |
-| 10 | `aef_e03_baseline` | 3,610.9 |
-| 11 | `aef_e54_delta` | 3,449.4 |
-| 12 | `aef_e20_baseline` | 3,352.7 |
-| 13 | `aef_e01_delta` | 2,375.7 |
-| 14 | `aef_e06_delta` | 2,131.4 |
-| 15 | `aef_e33_delta` | 1,770.3 |
-| 16 | `s2_b05_min_baseline` | 1,726.9 |
-| 17 | `aef_e60_latest` | 1,590.1 |
-| 18 | `aef_e12_delta` | 1,409.6 |
-| 19 | `aef_e52_delta` | 1,327.2 |
-| 20 | `s2_b06_mean_baseline` | 1,128.8 |
+| 1 | `aef_e12_baseline` | 3,726,591.4 |
+| 2 | `aef_e52_latest` | 1,733,780.8 |
+| 3 | `aef_e36_baseline` | 391,544.0 |
+| 4 | `aef_e06_delta` | 376,151.2 |
+| 5 | `aef_e22_delta` | 323,413.1 |
+| 6 | `aef_e12_latest` | 309,713.1 |
+| 7 | `aef_e01_baseline` | 220,046.0 |
+| 8 | `aef_e20_delta` | 208,918.3 |
+| 9 | `aef_e21_latest` | 143,827.9 |
+| 10 | `aef_e02_delta` | 53,251.3 |
+| 11 | `aef_e36_delta` | 44,064.7 |
+| 12 | `aef_e60_delta` | 35,434.7 |
+| 13 | `aef_e22_baseline` | 30,865.5 |
+| 14 | `aef_e30_latest` | 30,760.4 |
+| 15 | `aef_e06_latest` | 28,254.8 |
+| 16 | `aef_e01_delta` | 26,502.4 |
+| 17 | `aef_e03_baseline` | 25,015.5 |
+| 18 | `aef_e15_baseline` | 24,746.6 |
+| 19 | `aef_e15_latest` | 19,149.7 |
+| 20 | `aef_e43_latest` | 16,099.1 |
 
 ## Training configuration
 

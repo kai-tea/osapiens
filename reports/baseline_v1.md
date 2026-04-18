@@ -1,6 +1,6 @@
 # Baseline v1 — handoff to Kaite
 
-_Final numbers land here after the full 16-tile run finishes; this file is filled in by `src/eval.py` and `src/predict.py`. Hand-curated narrative only._
+_Run of 2026-04-18; code at `feature/kaite` HEAD. Headline numbers below are cross-validated on Cini's fold split but optimistic (see "Known weaknesses"); polygon-level leaderboard score will be lower._
 
 ## What was built
 
@@ -53,58 +53,120 @@ Four stages, each runnable in isolation:
   year across the three `*_days_since_2020` bands, stored in the
   feature parquet but not consumed by v1.
 
-## Validation numbers
+## Validation numbers (3-fold CV, 16 train tiles)
 
-_Populated automatically from `reports/baseline_results.md`; see that
-file for the per-fold table, per-MGRS breakdown, confusion matrices,
-top-20 feature importances, and training config._
+| fold | val rows | positives | threshold | F1 | IoU | PR-AUC | best_iter |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 311,985 | 248,091 | 0.326 | 0.973 | 0.948 | 0.992 | 2 |
+| 1 | 500,000 | 240,139 | 0.315 | 0.956 | 0.916 | 0.988 | 152 |
+| 2 | 406,902 | 214,243 | 0.663 | 0.974 | 0.950 | 0.996 | — |
+| **mean** |  |  | **0.435** | **0.968** | **0.938** | **0.992** |  |
+
+Top-20 feature importances are **all AEF embeddings** — `aef_e12_baseline`
+dominates (gain 3.7M), followed by `aef_e52_latest`, `aef_e36_baseline`
+and various `aef_*_delta` features. Neither S1 nor any S2 band temporal
+stat appears in the top 20.
+
+### Per-MGRS-prefix F1 breakdown (regional gap)
+
+| strongest 4 | weakest 4 |
+|---|---|
+| 48PWV 0.998 | 18NXJ 0.561 |
+| 48QWD 0.993 | 18NWH 0.587 |
+| 48PYB 0.993 | 18NWJ 0.684 |
+| 48PXC 0.993 | 19NBD 0.814 |
+
+**Regional generalisation gap** = 48PWV (0.998) − 18NXJ (0.561) = **0.437 F1**.
+Pathological near-zero regions (`18NWM` 1,092 rows, `18NYH` 16 rows) are
+thin tiles whose fold F1 is statistical noise.
+
+### Test-set submission (mean threshold = 0.4348)
+
+| tile | region | positive fraction | polygons | note |
+|---|---|---:|---:|---|
+| 18NVJ_1_6 | 18N (Amazon) | 0.03% | 1 | near-zero, under-predict |
+| 18NYH_2_1 | 18N (Amazon) | 11.1% | 187 | plausible |
+| 33NTE_5_1 | 33N (Africa) | 23.7% | 130 | plausible (out-of-training region) |
+| 47QMA_6_2 | 47Q (SE Asia) | **99.3%** | 5 | **catastrophic over-predict** |
+| 48PWA_0_6 | 48P (SE Asia) | **99.6%** | 1 | **catastrophic over-predict** |
+
+See `reports/baseline_results.md` for the full confusion matrices and
+training config.
 
 ## Known weaknesses
 
+- **Optimistic CV F1**: 0.97 is not a leaderboard-equivalent number.
+  `train_mask == 1` restricts eval to pixels where *some* source
+  observed the land with `obs_count ≥ 2`, which heavily biases toward
+  the alert frontier. The classifier is not being asked to score empty
+  background. Expect polygon IoU at submission time to be materially
+  lower.
+- **Catastrophic regional calibration failure on SE Asia** — the
+  headline issue. Test tiles `47QMA_6_2` and `48PWA_0_6` predict
+  99.3% and 99.6% positive. Root cause: training positive rate in
+  47Q/48P tiles is very high (those tiles miss GLAD-S2, so
+  `soft_target ≥ 0.5` fires whenever RADD+GLAD-L agree, which is
+  frequent in actively-deforested areas). The mean threshold 0.435 is
+  then too low for the test tiles' wider geographic distribution.
+  Fixing this is the **#1 priority for v2** — see "What to try next".
 - **Zero hard negatives**: Cini's synthesis only produces `hard_label`
   on pixels with `obs_count == 3` and zero source alerts — impossible
   for the 8 MGRS-47/48 SE-Asia tiles that lack GLAD-S2 coverage. Hence
-  the switch to soft-target binarisation; precision on those tiles
-  depends on whether `soft_target == 0` is a true "forest stayed
-  forest" signal there (it is — `obs == 1 ∧ alert == 0` is emitted by
-  both RADD and GLAD-L independently).
-- **Threshold spread across folds**: typically 3-4× between min and max.
-  Downstream submission uses the mean; median would be more robust
-  against a single pathological fold. Both values logged so Kaite can
-  override.
+  the switch to soft-target binarisation; `soft_target == 0` is a
+  genuine weak negative (`obs == 1 ∧ alert == 0` emitted by at least
+  one source).
+- **Regional generalisation gap F1 = 0.44** (48PWV 0.998 vs 18NXJ
+  0.561). This shows up in validation and is consistent with the
+  test-set blow-up.
+- **Threshold spread across folds**: 0.315–0.663, factor 2.1×. Median
+  (0.326) might be more robust than the mean (0.435) we ship —
+  switching keys is a one-line CLI flag in `src/predict.py`.
 - **Small training tiles are thin**: `18NWM_9_4` has 1,092 `train_mask`
   pixels, `18NYH_9_9` has 16 — fold metrics on those tiles are noisy
-  by construction.
-- **AEF dominates the model**: top feature importances are almost
-  entirely AEF delta embeddings. S1 and S2 temporal stats contribute
-  little marginal gain — signal that the foundation model has already
-  internalised the information we're engineering by hand.
+  by construction (both score 0.000).
+- **AEF dominates the model**: all top-20 features are AEF embeddings;
+  no S1 or S2 temporal stats survive. The foundation model has
+  internalised the signal we were engineering by hand.
 - **No cloud masking for S2**: nodata pixels are set to NaN
   (LightGBM handles natively) but partly-cloudy scenes are not
   explicitly filtered.
-- **Stratified sampling at feature-extraction time was the default in
-  v0** — switched to uniform before the final run so reported F1
-  reflects per-tile positive rates.
+- **Parallel-predict summary.json clobbering**: when `src/predict.py`
+  is run in multiple parallel processes (each on a subset of test
+  tiles) the last writer wins. Sequentially invoking it with all test
+  tiles avoids this; the shipped `submission/baseline_v1/summary.json`
+  was reconstructed manually from the worker logs.
 
-## What to try next
+## What to try next (ordered by expected leaderboard impact)
 
-1. **Label-fusion ablation**: re-run with `y = (soft_target >= 0.34)`
-   or directly regress on `soft_target` with `LGBMRegressor`. Whichever
-   improves IoU/PR-AUC without inflating the regional gap wins.
-2. **Drop redundant S2 features**: the top-20 feature table suggests
-   most S2 temporal stats are noise. Pruning to just baseline NDVI/NDMI
-   + deltas could speed up training 4-5× without hurting accuracy.
-3. **Per-region threshold calibration**: the submission uses a single
-   mean threshold for all 5 test tiles. Fitting one threshold per MGRS
-   prefix on the held-out fold's positives would likely tighten
-   precision on the Amazon tiles while keeping recall on SE Asia.
+1. **Fix the SE-Asia over-prediction — per-region threshold
+   calibration**. The 99.3% / 99.6% positive fractions on `47QMA_6_2`
+   and `48PWA_0_6` are the single biggest leaderboard risk. Fit one
+   threshold per MGRS-prefix group on each held-out fold's positives,
+   store as `baseline_results_thresholds.json` → `per_region`, and
+   route `src/predict.py` by tile's `region_id`. Fallback to the
+   current mean threshold for unseen prefixes (e.g. 33N).
+2. **Drop `train_mask` restriction during eval**. The high CV F1 is
+   an artefact of only scoring on the alert frontier. Re-run eval
+   against a full-tile held-out raster (predict everywhere, compute
+   IoU vs `hard_label == 1` after excluding `hard_label == 255`) to
+   get a number that tracks the leaderboard.
+3. **Regress on `soft_target` with `LGBMRegressor`** instead of the
+   0.5 binarisation. Uses all of Cini's confidence information and
+   avoids the single-threshold-at-training-time lossiness. Evaluate
+   against both the soft target (MSE) and the hard-0.5 binarisation
+   (F1).
 4. **Time-of-event head**: the `event_year` sidecar is already in the
-   parquet — a second LightGBM regression against the positive-pixel
-   subset would unlock the "predict *when* deforestation occurred"
-   bonus for minimal additional training cost.
-5. **Visualisation tool**: a small Folium or Streamlit viewer of
+   parquet. A second `LGBMRegressor` against positive-pixel `event_year`
+   unlocks the "predict *when* deforestation occurred" bonus for
+   minimal additional training cost; preserving the column in
+   `data.py` was intentional for this.
+5. **Prune S1 + S2 temporal features**. Top-20 importances use zero of
+   them; dropping all 210 S1+S2 features (keep just the 192 AEF dims)
+   should cut training time ~5× and memory ~2× without hurting
+   accuracy. Fast to ablate.
+6. **Visualisation tool**: a small Folium or Streamlit viewer of
    (S2 RGB, AEF PCA, prediction, weak-label overlay) per test tile
-   would directly feed the presentation rubric axis.
+   would directly feed the presentation rubric axis. Cheap bonus points.
 
 ## Reproduction
 
