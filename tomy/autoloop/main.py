@@ -37,6 +37,12 @@ from .predict import (
     emit_union_variant,
     predict_test_tile,
 )
+from .submission_builder import (
+    LeaderboardValidationError,
+    build_final_submission,
+    sanitise_geojson_in_place,
+    validate_geojson,
+)
 from .train import (
     MODELS_ROOT,
     POSITIVE_THRESHOLD,
@@ -53,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 SUMMARY_PATH = SUBMISSION_ROOT / "summary.md"
 SUMMARY_JSON_PATH = SUBMISSION_ROOT / "summary.json"
+FINAL_SUBMISSION_PATH = SUBMISSION_ROOT / "submission.geojson"
 
 
 def _train_tile_ids() -> list[str]:
@@ -404,6 +411,34 @@ def run(
             logger.exception("any_signal ensemble failed: %s", err)
 
     write_summary(heuristics, model_stages, naive_baselines)
+
+    # Sanitise every combined candidate file (intermediate files may have
+    # picked up non-time_step properties from upstream — strip them here
+    # so any file the operator picks manually is also leaderboard-safe).
+    for gj_path in SUBMISSION_ROOT.glob("*.geojson"):
+        if gj_path.name == FINAL_SUBMISSION_PATH.name:
+            continue
+        try:
+            sanitise_geojson_in_place(gj_path)
+        except Exception as err:
+            logger.warning("could not sanitise %s: %s", gj_path, err)
+
+    # Build the single default submission.geojson the operator uploads.
+    try:
+        report = build_final_submission(
+            SUMMARY_JSON_PATH, SUBMISSION_ROOT, FINAL_SUBMISSION_PATH
+        )
+        logger.info(
+            "submission.geojson ready: %s (%d features, from %s)",
+            FINAL_SUBMISSION_PATH, report["n_features"], report["chosen_candidate"],
+        )
+    except LeaderboardValidationError as err:
+        logger.error("FINAL SUBMISSION FAILED VALIDATION: %s", err)
+        return 2
+    except Exception as err:
+        logger.exception("could not build final submission: %s", err)
+        return 3
+
     return 0
 
 

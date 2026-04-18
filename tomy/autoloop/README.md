@@ -79,12 +79,33 @@ Environment variables:
 
 ## Outputs
 
-- `submission/autoloop/summary.md` — candidate table + recommended order.
+- **`submission/autoloop/submission.geojson`** — the canonical
+  leaderboard-ready deliverable. The script picks it automatically
+  (best CV model that beats the Hansen anchor; falls back to
+  `any_signal`; falls back to `hansen_tc25_ly22to25_ts`). Sanitised
+  (only `time_step` in properties, Polygon / MultiPolygon only) and
+  validated against leaderboard.md before being written. Upload this.
+- `submission/autoloop/submission.validation.json` — validator report
+  (feature count, geometry types, how many have time_step).
+- `submission/autoloop/summary.md` — candidate table + recommended order
+  if you want to override the auto-pick.
 - `submission/autoloop/summary.json` — machine-readable version.
-- `submission/autoloop/<tag>.geojson` — merged, one per candidate.
+- `submission/autoloop/<tag>.geojson` — merged per candidate (14 total).
 - `submission/autoloop/<tag>/<tile_id>.geojson` — per-tile.
 - `artifacts/models_autoloop/*.pt` + `*.json` — checkpoints + metadata.
 - `logs/<run_tag>_*.log` — stage logs.
+
+## Leaderboard.md compliance
+
+Every GeoJSON this autoloop writes is sanitised to match:
+
+  - file extension `.geojson`
+  - top-level `FeatureCollection`
+  - Polygon or MultiPolygon geometries only
+  - `properties` contains only `time_step` (YYMM int) or is `{}`
+
+`submission.geojson` goes through `validate_geojson` before the run
+exits — the process fails with a non-zero code if it doesn't pass.
 
 ## What this does *not* do
 

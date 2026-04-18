@@ -289,13 +289,31 @@ def emit_union_variant(
 
 
 def combine_submission_geojsons(candidate_tag: str) -> Path:
-    """Merge the per-tile GeoJSONs under submission/autoloop/<tag>/ into one."""
+    """Merge the per-tile GeoJSONs under submission/autoloop/<tag>/ into one.
+
+    Strips every property other than a valid YYMM ``time_step`` so the
+    combined file matches leaderboard.md: each feature has either
+    ``{"time_step": <int>}`` or ``{}``. Merging also drops any feature
+    whose geometry is not Polygon or MultiPolygon.
+    """
+    def _is_valid_yymm(v) -> bool:
+        if isinstance(v, bool) or not isinstance(v, int):
+            return False
+        return 1 <= v <= 9912 and 1 <= (v % 100) <= 12
+
     in_dir = SUBMISSION_ROOT / candidate_tag
     out_path = SUBMISSION_ROOT / f"{candidate_tag}.geojson"
     features: list[dict] = []
     for gj_path in sorted(in_dir.glob("*.geojson")):
         gj = json.loads(gj_path.read_text())
-        features.extend(gj.get("features", []))
+        for feat in gj.get("features", []):
+            geom = feat.get("geometry") or {}
+            if geom.get("type") not in ("Polygon", "MultiPolygon"):
+                continue
+            props = feat.get("properties") or {}
+            ts = props.get("time_step")
+            clean_props: dict = {"time_step": ts} if _is_valid_yymm(ts) else {}
+            features.append({"type": "Feature", "geometry": geom, "properties": clean_props})
     payload = {"type": "FeatureCollection", "features": features}
     out_path.write_text(json.dumps(payload))
     return out_path

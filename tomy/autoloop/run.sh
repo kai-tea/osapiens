@@ -76,4 +76,12 @@ else
 fi
 
 echo
-echo "Done. Candidates in submission/autoloop/ (summary.md + *.geojson)."
+if [ -f submission/autoloop/submission.geojson ]; then
+    echo "Done. Upload this file to the osapiens leaderboard:"
+    echo "    submission/autoloop/submission.geojson"
+    echo
+    echo "Validation report: submission/autoloop/submission.validation.json"
+    echo "All candidates + summary: submission/autoloop/summary.md"
+else
+    echo "Done, but no submission.geojson was produced — check logs/${RUN_TAG}_autoloop.log"
+fi
