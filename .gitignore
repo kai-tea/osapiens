@@ -21,6 +21,9 @@ ENV/
 data/
 content/
 splits/
+# Cini's frozen fold assignments are configuration, not generated output
+!cini/splits/
+!cini/splits/**
 
 # Generated artifacts (labelpacks, features, submissions) — reproducible via pipeline
 artifacts/

@@ -451,44 +451,23 @@ def build_tile_features(
     return features, names, labels, ref_profile
 
 
-def _stratified_pixel_sample(
+def _pixel_sample(
     train_mask: np.ndarray,
-    soft_target: np.ndarray | None,
     max_pixels: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Return a flat index array of sampled pixels inside ``train_mask``.
+    """Uniformly sample pixel indices inside ``train_mask``.
 
-    For train tiles (``soft_target`` present) samples are stratified by
-    the soft-target binarisation at 0.5 so the positive rate is preserved
-    even after aggressive downsampling. For test tiles (``soft_target``
-    is ``None``) samples are uniform.
+    Preserves the tile's real positive rate so downstream eval metrics
+    reflect the natural class imbalance — ``LightGBM``'s
+    ``is_unbalance=True`` handles the imbalance at training time.
+    Returns all eligible pixels when ``max_pixels <= 0`` or when the
+    eligible pool is smaller than the cap.
     """
-    flat_mask = train_mask.reshape(-1).astype(bool)
-    eligible = np.flatnonzero(flat_mask)
+    eligible = np.flatnonzero(train_mask.reshape(-1).astype(bool))
     if eligible.size <= max_pixels or max_pixels <= 0:
         return eligible
-
-    if soft_target is None:
-        return rng.choice(eligible, size=max_pixels, replace=False)
-
-    y = (soft_target.reshape(-1)[eligible] >= 0.5)
-    pos_idx = eligible[y]
-    neg_idx = eligible[~y]
-    if pos_idx.size == 0 or neg_idx.size == 0:
-        return rng.choice(eligible, size=max_pixels, replace=False)
-    n_pos = min(pos_idx.size, max_pixels // 2)
-    n_neg = max_pixels - n_pos
-    n_neg = min(n_neg, neg_idx.size)
-    n_pos = min(pos_idx.size, max_pixels - n_neg)
-    chosen = np.concatenate(
-        [
-            rng.choice(pos_idx, size=n_pos, replace=False),
-            rng.choice(neg_idx, size=n_neg, replace=False),
-        ]
-    )
-    rng.shuffle(chosen)
-    return chosen
+    return rng.choice(eligible, size=max_pixels, replace=False)
 
 
 def build_tile_dataset(
@@ -508,10 +487,10 @@ def build_tile_dataset(
     F, H, W = features.shape
 
     rng = np.random.default_rng(seed)
-    soft = labels.get("soft_target")
-    sample_idx = _stratified_pixel_sample(
-        labels["train_mask"], soft, max_pixels_per_tile or -1, rng
+    sample_idx = _pixel_sample(
+        labels["train_mask"], max_pixels_per_tile or -1, rng
     )
+    soft = labels.get("soft_target")
 
     rows, cols = np.unravel_index(sample_idx, (H, W))
     feature_matrix = features.reshape(F, -1)[:, sample_idx].T.astype(np.float32)
