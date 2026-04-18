@@ -162,6 +162,16 @@ def _month_index(year: int, month: int) -> int:
     return (year - 2020) * 12 + (month - 1)
 
 
+def _grids_match(src: rasterio.DatasetReader, ref_profile: dict) -> bool:
+    """True when ``src`` is already on the reference grid (skip the warp)."""
+    return (
+        src.crs == ref_profile["crs"]
+        and src.transform == ref_profile["transform"]
+        and src.width == ref_profile["width"]
+        and src.height == ref_profile["height"]
+    )
+
+
 def _warp_to_ref(
     path: Path,
     ref_profile: dict,
@@ -171,27 +181,34 @@ def _warp_to_ref(
     """Open a raster and reproject it onto the S2 reference grid.
 
     Returns ``(B, H_ref, W_ref)`` float32 with nodata converted to NaN.
-    Works for rasters already in the ref CRS (resamples if resolution
-    differs) and for rasters in a different CRS (e.g. AEF EPSG:4326).
+    Skips the warp when the source is already on the reference grid (the
+    common case for monthly S2 files, since ``ref_profile`` is read from
+    one of them).
     """
     with rasterio.open(path) as src:
         src_data = src.read().astype(np.float32)
-        dst = np.full(
-            (src.count, ref_profile["height"], ref_profile["width"]),
-            np.nan,
-            dtype=np.float32,
-        )
-        reproject(
-            source=src_data,
-            destination=dst,
-            src_transform=src.transform,
-            src_crs=src.crs,
-            dst_transform=ref_profile["transform"],
-            dst_crs=ref_profile["crs"],
-            resampling=resampling,
-            src_nodata=src.nodata,
-            dst_nodata=np.nan,
-        )
+        src_nodata = src.nodata
+        if _grids_match(src, ref_profile):
+            dst = src_data
+            if src_nodata is not None:
+                dst[dst == src_nodata] = np.nan
+        else:
+            dst = np.full(
+                (src.count, ref_profile["height"], ref_profile["width"]),
+                np.nan,
+                dtype=np.float32,
+            )
+            reproject(
+                source=src_data,
+                destination=dst,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=ref_profile["transform"],
+                dst_crs=ref_profile["crs"],
+                resampling=resampling,
+                src_nodata=src_nodata,
+                dst_nodata=np.nan,
+            )
     if nodata_fill is not None:
         dst[dst == nodata_fill] = np.nan
     return dst
