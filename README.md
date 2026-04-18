@@ -14,6 +14,27 @@ If you are new to the repository, use these files in this order:
 2. [challenge.ipynb](./challenge.ipynb) for the full walkthrough of the dataset structure, label encodings, visualizations, and submission example.
 3. [download_data.py](./download_data.py) for the dataset download entrypoint used by the project.
 
+## Simple Hackathon Pipeline
+
+For a beginner-friendly baseline, use the refactored Mark 1 pipeline files:
+
+- [main.py](./Models_Kang-I/mark1/main.py): end-to-end training and validation prediction flow
+- [data.py](./Models_Kang-I/mark1/data.py): raster loading, alignment, weak-label fusion, and tile sampling
+- [features.py](./Models_Kang-I/mark1/features.py): simple feature construction from yearly embeddings
+- [model.py](./Models_Kang-I/mark1/model.py): model training, evaluation, prediction, and saving
+
+Run it with:
+
+```bash
+python Models_Kang-I/mark1/main.py --data_root data/makeathon-challenge --output_dir outputs/mark1
+```
+
+The active flow is intentionally simple:
+
+```text
+load data -> build features -> train -> predict -> save outputs
+```
+
 ## Repository Guide
 
 - [challenge.ipynb](./challenge.ipynb): Main challenge notebook with data layout, modality descriptions, label definitions, examples, and submission guidance.

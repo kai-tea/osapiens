@@ -19,6 +19,7 @@ ENV/
 
 # Output directories
 data/
+outputs/
 content/
 reports/
 splits/
@@ -26,3 +27,5 @@ splits/
 # Logs
 *.log
 .claude/
+
+outputs/
