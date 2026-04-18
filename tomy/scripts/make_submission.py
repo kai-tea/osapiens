@@ -33,15 +33,17 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tifs = sorted(pred_dir.glob("pred_*.tif"))
+    tifs = sorted(pred_dir.glob("*_binary.tif"))
     if not tifs:
-        print(f"[FAIL] no pred_*.tif in {pred_dir}", file=sys.stderr)
+        tifs = sorted(pred_dir.glob("pred_*.tif"))
+    if not tifs:
+        print(f"[FAIL] no *_binary.tif or pred_*.tif in {pred_dir}", file=sys.stderr)
         return 1
 
     combined_features: list[dict] = []
     summary: dict[str, dict] = {}
     for tif in tifs:
-        tile_id = tif.stem.removeprefix("pred_")
+        tile_id = tif.stem.removeprefix("pred_").removesuffix("_binary")
         per_tile_out = out_dir / f"{tile_id}.geojson"
         try:
             gj = raster_to_geojson(tif, output_path=per_tile_out, min_area_ha=args.min_area_ha)
@@ -61,7 +63,7 @@ def main() -> int:
     combined = {"type": "FeatureCollection", "features": combined_features}
     combined_path = out_dir / "submission.geojson"
     with open(combined_path, "w") as f:
-        json.dump(combined, f)
+        json.dump(combined, f, indent=2)
     with open(out_dir / "submission_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     print(f"[DONE] combined -> {combined_path} ({len(combined_features)} polygons across {len(tifs)} tiles)")

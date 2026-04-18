@@ -9,3 +9,8 @@ botocore  # Version defined by boto3, but explicitly imported
 tqdm~=4.66
 ipykernel
 jupyter
+# ML stack used by tomy/src/baseline_v1.py + postprocess.py
+scipy~=1.14
+scikit-learn~=1.5
+xgboost~=2.1
+joblib~=1.4

@@ -43,6 +43,12 @@ def main() -> int:
     parser.add_argument("--years", default="2021,2022,2023,2024,2025")
     parser.add_argument("--split", default="test")
     parser.add_argument("--tiles", default=None, help="comma-separated subset of tile IDs; default: all")
+    parser.add_argument(
+        "--forest-source",
+        choices=("jrc", "ndvi"),
+        default="jrc",
+        help="2020-forest mask applied as the final AND gate (must match training).",
+    )
     args = parser.parse_args()
 
     threshold = args.threshold
@@ -68,8 +74,9 @@ def main() -> int:
     cfg = BaselineConfig(
         analysis_years=tuple(int(y) for y in args.years.split(",")),
         postprocess=pp_cfg,
+        forest_source=args.forest_source,
     )
-    print(f"[INFO] {pp_cfg}")
+    print(f"[INFO] {pp_cfg} forest_source={args.forest_source}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -92,7 +99,7 @@ def main() -> int:
             # still write an all-zero raster so downstream tooling has a consistent set
             save_prediction_raster(prob.astype("uint8"), tile, args.split, out_dir)
             continue
-        forest = forest_mask_2020(tile, args.split)
+        forest = forest_mask_2020(tile, args.split, source=args.forest_source)
         binary = postprocess(prob, forest_mask=forest, config=pp_cfg)
         path = save_prediction_raster(binary, tile, args.split, out_dir)
         frac = float(binary.mean())

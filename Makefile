@@ -25,3 +25,6 @@ install: .venv/bin/uv
 
 download_data_from_s3:
 	.venv/bin/python3 -m download_data
+
+download_jrc_forest:
+	.venv/bin/python3 -m tomy.scripts.download_jrc_forest

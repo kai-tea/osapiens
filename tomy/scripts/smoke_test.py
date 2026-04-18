@@ -81,9 +81,37 @@ def main() -> int:
     feats, names = dl.year_over_year_features(tile, args.year, args.split, baseline_year=2020)
     print(f"[FEAT] year_over_year_features -> {feats.shape} ({len(names)} channels)")
 
-    # --- Forest mask ---
-    forest = lf.forest_mask_2020(tile, args.split)
-    print(f"[MASK] 2020 forest fraction: {forest.mean():.2%}")
+    # --- Forest mask: compare JRC vs NDVI ---
+    # Bypass the cache by calling each source explicitly so we don't depend on
+    # call order across a shared lru_cache key.
+    from tomy.src import jrc_forest as jrc
+
+    ndvi_mask = lf._ndvi_forest_mask(tile, args.split, ndvi_threshold=0.6)
+    jrc_mask = jrc.load_jrc_on_tile_grid(tile, args.split)
+    if jrc_mask is None:
+        print(
+            f"[MASK] JRC unavailable for {tile} — run `make download_jrc_forest` first. "
+            f"NDVI-only forest fraction: {ndvi_mask.mean():.2%}"
+        )
+        forest = ndvi_mask
+    else:
+        inter = (jrc_mask & ndvi_mask).sum()
+        union = (jrc_mask | ndvi_mask).sum()
+        iou = inter / union if union else float("nan")
+        print(
+            f"[MASK] JRC forest={jrc_mask.mean():.2%}  NDVI forest={ndvi_mask.mean():.2%}  "
+            f"IoU(JRC,NDVI)={iou:.3f}"
+        )
+        if iou < 0.5:
+            print(
+                f"[WARN] low JRC-vs-NDVI agreement (IoU={iou:.3f}) — probable reprojection "
+                "or tile-naming bug. Visualise before retraining."
+            )
+        forest = jrc_mask  # downstream fusion uses the default (jrc) via lru_cache
+
+    # Exercise the public forest_mask_2020 path too so any integration bug surfaces here.
+    default_mask = lf.forest_mask_2020(tile, args.split)
+    print(f"[MASK] default gate forest fraction: {default_mask.mean():.2%}")
 
     # --- Label fusion ---
     fused = lf.fuse_post2020(tile, args.split)

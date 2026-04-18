@@ -10,8 +10,10 @@ that were forest in 2020.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, timedelta
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +27,9 @@ from .data_loader import (
     s2_year_stack,
     tile_grid,
 )
+from .jrc_forest import load_jrc_on_tile_grid
+
+log = logging.getLogger(__name__)
 
 POST2020 = date(2020, 1, 1)
 RADD_EPOCH = date(2014, 12, 31)
@@ -192,15 +197,8 @@ def load_all_labels(tile_id: str, split: str = "train") -> dict[str, DecodedLabe
 # ---------- 2020 forest mask ----------
 
 
-def forest_mask_2020(
-    tile_id: str,
-    split: str = "train",
-    ndvi_threshold: float = 0.6,
-) -> np.ndarray:
-    """Bool mask: pixels that look like forest in 2020 (median NDVI > threshold).
-
-    Uses Sentinel-2 B04 (red) and B08 (NIR) medians across 2020.
-    """
+def _ndvi_forest_mask(tile_id: str, split: str, ndvi_threshold: float) -> np.ndarray:
+    """Fallback: 2020 NDVI > threshold from S2 B04/B08 monthly medians."""
     stack, _ = s2_year_stack(tile_id, 2020, split, bands=(4, 8))
     if stack.size == 0:
         g = tile_grid(tile_id, split)
@@ -217,6 +215,33 @@ def forest_mask_2020(
     return np.nan_to_num(ndvi, nan=0.0) > ndvi_threshold
 
 
+@lru_cache(maxsize=64)
+def forest_mask_2020(
+    tile_id: str,
+    split: str = "train",
+    ndvi_threshold: float = 0.6,
+    source: str = "jrc",
+) -> np.ndarray:
+    """Bool mask of pixels that were forest in 2020, aligned to the tile grid.
+
+    ``source`` selects which definition of "forest in 2020" is used:
+      - ``"jrc"`` (default): JRC Global Forest Cover 2020 V3 — the EUDR legal
+        baseline; falls back to NDVI if JRC coverage is not available locally.
+      - ``"ndvi"``: median NDVI > ``ndvi_threshold`` computed from S2 B04/B08.
+
+    Memoised across calls within one process because the same tile is gated
+    multiple times per run (label fusion + postprocessing + evaluation).
+    """
+    if source == "jrc":
+        jrc = load_jrc_on_tile_grid(tile_id, split)
+        if jrc is not None:
+            return jrc
+        log.warning("JRC coverage missing for %s; falling back to NDVI gate", tile_id)
+    elif source != "ndvi":
+        raise ValueError(f"unknown forest-mask source: {source!r} (expected 'jrc' or 'ndvi')")
+    return _ndvi_forest_mask(tile_id, split, ndvi_threshold)
+
+
 # ---------- Fusion ----------
 
 
@@ -225,6 +250,7 @@ def fuse_post2020(
     split: str = "train",
     gate_by_forest: bool = True,
     min_sources: int = 2,
+    forest_source: str = "jrc",
 ) -> dict[str, np.ndarray]:
     """Fuse all weak-label sources into a post-2020 deforestation training target.
 
@@ -280,7 +306,7 @@ def fuse_post2020(
     event_days = np.where(any_alert == 1, event_days, 0)
 
     if gate_by_forest:
-        forest = forest_mask_2020(tile_id, split)
+        forest = forest_mask_2020(tile_id, split, source=forest_source)
         confident_pos = (confident_pos & forest.astype(np.uint8)).astype(np.uint8)
         any_alert = (any_alert & forest.astype(np.uint8)).astype(np.uint8)
         confident_neg = ((source_count == 0) & forest).astype(np.uint8)

@@ -76,23 +76,46 @@ def pixel_metrics(pred: np.ndarray, target: np.ndarray, mask: np.ndarray | None 
     return PixelMetrics(tp, fp, fn, tn)
 
 
-def target_for_tile(tile_id: str, split: str = "train", min_sources: int = 2) -> np.ndarray:
-    """Proxy ground truth: post-2020 confident_pos, gated by 2020 forest mask."""
-    fused = fuse_post2020(tile_id, split=split, gate_by_forest=True, min_sources=min_sources)
+def target_for_tile(
+    tile_id: str,
+    split: str = "train",
+    min_sources: int = 2,
+    forest_source: str = "jrc",
+) -> np.ndarray:
+    """Proxy ground truth: post-2020 confident_pos, gated by 2020 forest mask.
+
+    ``forest_source`` picks which 2020-forest definition to use ("jrc" | "ndvi").
+    Keeping this decoupled from the gate used during training/postprocessing is
+    essential for apples-to-apples A/B: all variants must be scored against
+    the same reference gate.
+    """
+    fused = fuse_post2020(
+        tile_id,
+        split=split,
+        gate_by_forest=True,
+        min_sources=min_sources,
+        forest_source=forest_source,
+    )
     return fused["confident_pos"].astype(bool)
 
 
-def evaluate_fold(predict_fn, tile_ids: list[str], split: str = "train") -> tuple[PixelMetrics, dict[str, dict]]:
+def evaluate_fold(
+    predict_fn,
+    tile_ids: list[str],
+    split: str = "train",
+    target_forest_source: str = "jrc",
+) -> tuple[PixelMetrics, dict[str, dict]]:
     """Aggregate pixel metrics across ``tile_ids``.
 
     ``predict_fn(tile_id) -> np.ndarray[bool]`` must produce a prediction on the
-    tile's canonical grid.
+    tile's canonical grid. ``target_forest_source`` selects the reference gate
+    used to build the evaluation target.
     """
     total = PixelMetrics(0, 0, 0, 0)
     per_tile: dict[str, dict] = {}
     for tile in tile_ids:
         pred = predict_fn(tile).astype(bool)
-        target = target_for_tile(tile, split=split)
+        target = target_for_tile(tile, split=split, forest_source=target_forest_source)
         if pred.shape != target.shape:
             raise ValueError(f"{tile}: pred shape {pred.shape} != target {target.shape}")
         m = pixel_metrics(pred, target)
@@ -106,12 +129,13 @@ def cv_evaluate(
     tiles: list[str],
     n_folds: int = 5,
     split: str = "train",
+    target_forest_source: str = "jrc",
 ) -> dict:
     """Run geographic CV. ``predict_fn_factory(train_tiles) -> predict_fn``."""
     fold_results = []
     for fold_idx, train, val in fold_iter(tiles, n_folds):
         predict_fn = predict_fn_factory(train)
-        total, per_tile = evaluate_fold(predict_fn, val, split=split)
+        total, per_tile = evaluate_fold(predict_fn, val, split=split, target_forest_source=target_forest_source)
         fold_results.append(
             {
                 "fold": fold_idx,

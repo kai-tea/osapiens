@@ -50,6 +50,7 @@ class BaselineConfig:
     pos_per_tile: int = DEFAULT_POS_PER_TILE
     neg_per_tile: int = DEFAULT_NEG_PER_TILE
     seed: int = 42
+    forest_source: str = "jrc"  # "jrc" | "ndvi" — gates both labels and predictions
     postprocess: PostprocessConfig = field(default_factory=PostprocessConfig)
     xgb_params: dict = field(
         default_factory=lambda: dict(
@@ -107,8 +108,10 @@ def build_training_set(
     names: list[str] | None = None
 
     for tile in train_tiles:
-        fused = fuse_post2020(tile, split=split, gate_by_forest=True, min_sources=2)
-        forest = forest_mask_2020(tile, split=split)
+        fused = fuse_post2020(
+            tile, split=split, gate_by_forest=True, min_sources=2, forest_source=cfg.forest_source
+        )
+        forest = forest_mask_2020(tile, split=split, source=cfg.forest_source)
         for year in cfg.analysis_years:
             try:
                 feats, chan_names = year_over_year_features(tile, year, split=split, baseline_year=2020)
@@ -211,7 +214,7 @@ def predict_tile_binary(
     p_max = predict_proba_max(model, tile_id, split, cfg)
     if not p_max.any():
         return p_max.astype(np.uint8)
-    forest = forest_mask_2020(tile_id, split)
+    forest = forest_mask_2020(tile_id, split, source=cfg.forest_source)
     return postprocess(p_max, forest_mask=forest, config=cfg.postprocess)
 
 

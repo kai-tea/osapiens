@@ -51,14 +51,20 @@ def filter_tiles_with_data(tiles: list[str], split: str = "train") -> list[str]:
     return keep
 
 
-def _evaluate_on_val(model, val_tiles: list[str], cfg: BaselineConfig) -> dict:
-    """Run inference on val tiles, sweep thresholds, return metrics."""
+def _evaluate_on_val(model, val_tiles: list[str], cfg: BaselineConfig, eval_gate: str = "jrc") -> dict:
+    """Run inference on val tiles, sweep thresholds, return metrics.
+
+    ``eval_gate`` picks the forest definition used to build the evaluation
+    target and the validity mask, independent of ``cfg.forest_source`` (which
+    controls training labels + postprocess gating). Keeping them decoupled
+    lets us A/B gates on a fixed reference target.
+    """
     probs_targets = []
     for tile in val_tiles:
         t0 = time.time()
         prob = predict_proba_max(model, tile, "train", cfg)
-        forest = forest_mask_2020(tile, "train").astype(bool)
-        target = target_for_tile(tile, split="train")
+        forest = forest_mask_2020(tile, "train", source=eval_gate).astype(bool)
+        target = target_for_tile(tile, split="train", forest_source=eval_gate)
         probs_targets.append((prob, target, forest))
         print(f"[VAL] {tile}: prob={prob.mean():.3f} target_frac={target.mean():.3%} ({time.time() - t0:.1f}s)")
 
@@ -95,6 +101,25 @@ def main() -> int:
     parser.add_argument("--years", type=str, default="2021,2022,2023,2024,2025")
     parser.add_argument("--out-dir", type=str, default=".")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--forest-source",
+        choices=("jrc", "ndvi"),
+        default="jrc",
+        help="2020-forest mask used for training labels + predict-time gating",
+    )
+    parser.add_argument(
+        "--eval-gate",
+        choices=("jrc", "ndvi"),
+        default="jrc",
+        help="2020-forest mask used to build the evaluation target (kept decoupled from "
+        "--forest-source so A/B runs are scored on the same reference).",
+    )
+    parser.add_argument(
+        "--run-tag",
+        default="",
+        help="Optional suffix appended to output filenames (e.g. 'jrc', 'ndvi') so "
+        "runs don't overwrite each other's models/reports.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -107,7 +132,10 @@ def main() -> int:
         pos_per_tile=args.pos_per_tile,
         neg_per_tile=args.neg_per_tile,
         seed=args.seed,
+        forest_source=args.forest_source,
     )
+    tag = f"_{args.run_tag}" if args.run_tag else ""
+    print(f"[CFG ] forest_source={args.forest_source} eval_gate={args.eval_gate} tag={tag or '(none)'}")
 
     all_tiles = filter_tiles_with_data(list_tiles("train"))
     if not all_tiles:
@@ -144,7 +172,7 @@ def main() -> int:
     model = train_model(X, y, cfg)
     print(f"[STEP] trained in {time.time() - t0:.1f}s")
 
-    model_path = out_dir / "models" / f"v1_fold{fold_label}.joblib"
+    model_path = out_dir / "models" / f"v1_fold{fold_label}{tag}.joblib"
     save_model(model, model_path)
     print(f"[STEP] saved {model_path}")
 
@@ -161,12 +189,14 @@ def main() -> int:
             "pos_per_tile": cfg.pos_per_tile,
             "neg_per_tile": cfg.neg_per_tile,
             "seed": cfg.seed,
+            "forest_source": cfg.forest_source,
+            "eval_gate": args.eval_gate,
         },
     }
 
     if val_tiles:
         print("[STEP] evaluating on val ...")
-        summary["val_metrics"] = _evaluate_on_val(model, val_tiles, cfg)
+        summary["val_metrics"] = _evaluate_on_val(model, val_tiles, cfg, eval_gate=args.eval_gate)
         print(
             f"[VAL] best IoU={summary['val_metrics']['best_iou']:.4f} "
             f"@ thr={summary['val_metrics']['best_threshold_iou']:.2f}"
@@ -176,7 +206,7 @@ def main() -> int:
             f"@ thr={summary['val_metrics']['best_threshold_f1']:.2f}"
         )
 
-    metrics_path = out_dir / "reports" / f"v1_fold{fold_label}_metrics.json"
+    metrics_path = out_dir / "reports" / f"v1_fold{fold_label}{tag}_metrics.json"
     with open(metrics_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"[DONE] metrics -> {metrics_path}")
