@@ -16,7 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--split-dir",
-        default="splits/split_v1",
+        default="cini/splits/split_v1",
         help="Path to the frozen split directory.",
     )
     parser.add_argument(

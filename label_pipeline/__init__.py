@@ -1,11 +1,11 @@
-"""Weak-label pipeline for the osapiens deforestation challenge."""
+"""Compatibility wrapper for the Cini-owned label pipeline package."""
 
-from .build import build_labelpack
-from .decoders import decode_gladl, decode_glads2, decode_radd
+from importlib import import_module
 
-__all__ = [
-    "build_labelpack",
-    "decode_gladl",
-    "decode_glads2",
-    "decode_radd",
-]
+_impl = import_module("cini.label_pipeline")
+
+__path__ = _impl.__path__
+__all__ = getattr(_impl, "__all__", [])
+
+for _name in __all__:
+    globals()[_name] = getattr(_impl, _name)

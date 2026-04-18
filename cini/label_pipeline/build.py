@@ -379,7 +379,7 @@ def run_build(
     tile_id: str | None = None,
     force: bool = False,
 ) -> None:
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
     data_root = Path(data_root)
     split_dir = Path(split_dir)
     output_root = Path(output_root)

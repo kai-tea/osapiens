@@ -11,7 +11,7 @@ from label_pipeline.model_inputs import DEFAULT_BUCKET_NAME, prepare_model_input
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare full model-input handoff manifests.")
     parser.add_argument("--data-root", default="data/makeathon-challenge")
-    parser.add_argument("--split-dir", default="splits/split_v1")
+    parser.add_argument("--split-dir", default="cini/splits/split_v1")
     parser.add_argument("--label-root", default="artifacts/labels_v1")
     parser.add_argument("--output-root", default="artifacts/model_inputs_v1")
     parser.add_argument("--bucket-name", default=DEFAULT_BUCKET_NAME)

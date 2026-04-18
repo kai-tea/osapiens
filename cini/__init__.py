@@ -1,0 +1,1 @@
+"""Cini-owned challenge implementation."""

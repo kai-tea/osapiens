@@ -41,7 +41,7 @@ class ParsedRemoteFile:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return Path(__file__).resolve().parents[2]
 
 
 def _relative_posix(path: str | Path, root: str | Path | None = None) -> str:

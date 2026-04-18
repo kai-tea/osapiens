@@ -29,4 +29,4 @@ download_data_from_s3:
 	.venv/bin/python3 -m download_data
 
 prepare_model_inputs_v1:
-	PYTHONPATH=. .venv/bin/python3 scripts/prepare_model_inputs_v1.py --data-root data/makeathon-challenge --split-dir splits/split_v1 --label-root artifacts/labels_v1 --output-root artifacts/model_inputs_v1 --force --max-workers 32
+	PYTHONPATH=. .venv/bin/python3 cini/scripts/prepare_model_inputs_v1.py --data-root data/makeathon-challenge --split-dir cini/splits/split_v1 --label-root artifacts/labels_v1 --output-root artifacts/model_inputs_v1 --force --max-workers 32

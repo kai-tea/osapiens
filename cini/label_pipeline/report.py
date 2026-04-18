@@ -61,7 +61,7 @@ def collect_tile_source_stats(manifest: pd.DataFrame, repo_root: str | Path | No
     import rasterio
 
     if repo_root is None:
-        repo_root = Path(__file__).resolve().parents[1]
+        repo_root = Path(__file__).resolve().parents[2]
     repo_root = Path(repo_root)
 
     rows: list[dict[str, object]] = []

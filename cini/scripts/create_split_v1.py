@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--output-dir",
-        default="splits/split_v1",
+        default="cini/splits/split_v1",
         help="Directory where split_v1 CSV files will be written.",
     )
     parser.add_argument(
