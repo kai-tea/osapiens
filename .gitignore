@@ -20,8 +20,12 @@ ENV/
 # Output directories
 data/
 content/
-reports/
 splits/
+
+# Generated artifacts (labelpacks, features, submissions) — reproducible via pipeline
+artifacts/
+artifacts
+submission/
 
 # Logs
 *.log
