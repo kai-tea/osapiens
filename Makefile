@@ -1,6 +1,8 @@
 # make sure this is executed with bash
 SHELL := /bin/bash
 
+PYTHON ?= python3
+
 
 YELLOW := "\e[1;33m"
 NC := "\e[0m"
@@ -12,7 +14,7 @@ INFO := @bash -c '\
   printf $(NC)' SOME_VALUE
 
 .venv:  # creates .venv folder if does not exist
-	python3.10 -m venv .venv
+	$(PYTHON) -m venv .venv
 
 
 .venv/bin/uv: .venv # installs latest pip
@@ -25,3 +27,6 @@ install: .venv/bin/uv
 
 download_data_from_s3:
 	.venv/bin/python3 -m download_data
+
+prepare_model_inputs_v1:
+	PYTHONPATH=. .venv/bin/python3 scripts/prepare_model_inputs_v1.py --data-root data/makeathon-challenge --split-dir splits/split_v1 --label-root artifacts/labels_v1 --output-root artifacts/model_inputs_v1 --force --max-workers 32

@@ -24,7 +24,6 @@ ENV/
 data/
 content/
 reports/
-splits/
 
 # Logs
 *.log
