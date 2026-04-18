@@ -32,7 +32,13 @@ from sklearn.metrics import (
     precision_recall_curve,
 )
 
-from .data import FEATURES_ROOT, feature_names, load_tile_manifest
+from .data import (
+    FEATURES_ROOT,
+    build_tile_features,
+    feature_names,
+    load_tile_manifest,
+    resolve_tile_paths,
+)
 from .train import (
     POSITIVE_THRESHOLD,
     TrainConfig,
@@ -194,6 +200,120 @@ def run_fold(
     return metrics, importances, confusion, info
 
 
+def run_fold_ungated(
+    df_features_cache: pd.DataFrame,
+    fold_id: int,
+    fold_assignments: pd.DataFrame,
+    config: TrainConfig,
+    positive_threshold: float,
+    manifest: pd.DataFrame,
+):
+    """Ungated-eval variant: train on the gated sampled cache, score over
+    every pixel of each held-out tile's full raster.
+
+    Pixels outside ``train_mask`` are labelled ``0`` (assumed-negative,
+    per the leaderboard framing). Threshold selection, per-region
+    aggregation, and metric computation otherwise match ``run_fold``.
+    """
+    val_tiles = fold_assignments.loc[fold_assignments["fold_id"] == fold_id, "tile_id"].tolist()
+    train_tiles = fold_assignments.loc[fold_assignments["fold_id"] != fold_id, "tile_id"].tolist()
+
+    df_train = df_features_cache.loc[df_features_cache["tile_id"].isin(train_tiles)].reset_index(
+        drop=True
+    )
+    X_tr, y_tr, w_tr = prepare_xy(df_train, threshold=positive_threshold)
+    groups = df_train.loc[X_tr.index, "tile_id"]
+    model, info = train_classifier(X_tr, y_tr, w_tr, config, groups=groups)
+
+    region_of_tile = (
+        fold_assignments.set_index("tile_id")["region_id"].to_dict()
+    )
+    per_tile: dict[str, dict[str, object]] = {}
+    proba_chunks: list[np.ndarray] = []
+    y_chunks: list[np.ndarray] = []
+    region_chunks: list[np.ndarray] = []
+
+    for tile_id in val_tiles:
+        logger.info("fold %d ungated: scoring full raster of tile %s", fold_id, tile_id)
+        paths = resolve_tile_paths(tile_id, manifest=manifest)
+        features, _names, labels, _ref = build_tile_features(paths)
+        F, H, W = features.shape
+        X = features.reshape(F, -1).T.astype(np.float32)
+        proba = model.predict_proba(X)[:, 1].astype(np.float32)
+
+        train_msk = labels["train_mask"].reshape(-1) == 1
+        soft = labels["soft_target"].reshape(-1)
+        y = np.zeros(H * W, dtype=np.int8)
+        y[train_msk] = (soft[train_msk] >= positive_threshold).astype(np.int8)
+
+        proba_chunks.append(proba)
+        y_chunks.append(y)
+        region_chunks.append(
+            np.full(H * W, region_of_tile.get(tile_id, paths.region_id), dtype=object)
+        )
+        per_tile[tile_id] = {
+            "region_id": region_of_tile.get(tile_id, paths.region_id),
+            "n_pixels": int(H * W),
+            "n_train_mask": int(train_msk.sum()),
+            "n_positive": int(y.sum()),
+            "positive_fraction_at_05": float((proba >= 0.5).mean()),
+        }
+
+    proba_full = np.concatenate(proba_chunks)
+    y_full = np.concatenate(y_chunks)
+    region_full = np.concatenate(region_chunks)
+
+    prec_curve, rec_curve, thresh_curve = precision_recall_curve(y_full, proba_full)
+    f1_curve = _f1_from_pr(prec_curve, rec_curve)
+    best_idx = int(np.argmax(f1_curve[:-1])) if len(thresh_curve) else 0
+    best_threshold = float(thresh_curve[best_idx]) if len(thresh_curve) else 0.5
+    pred = (proba_full >= best_threshold).astype(np.int8)
+
+    tn, fp, fn, tp = confusion_matrix(y_full, pred, labels=[0, 1]).ravel()
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    iou = jaccard_score(y_full, pred, zero_division=0)
+    pr_auc = average_precision_score(y_full, proba_full)
+
+    region_breakdown: dict[str, dict[str, float]] = {}
+    for region in np.unique(region_full):
+        mask = region_full == region
+        yr = y_full[mask]
+        pr = (proba_full[mask] >= best_threshold).astype(np.int8)
+        tp_r = int(((pr == 1) & (yr == 1)).sum())
+        fp_r = int(((pr == 1) & (yr == 0)).sum())
+        fn_r = int(((pr == 0) & (yr == 1)).sum())
+        prec_r = tp_r / (tp_r + fp_r) if (tp_r + fp_r) > 0 else 0.0
+        rec_r = tp_r / (tp_r + fn_r) if (tp_r + fn_r) > 0 else 0.0
+        f1_r = 2 * prec_r * rec_r / (prec_r + rec_r) if (prec_r + rec_r) > 0 else 0.0
+        region_breakdown[str(region)] = {
+            "n_rows": int(mask.sum()),
+            "n_positives": int(yr.sum()),
+            "precision": prec_r,
+            "recall": rec_r,
+            "f1": f1_r,
+        }
+
+    metrics = FoldMetrics(
+        fold_id=fold_id,
+        train_tiles=list(train_tiles),
+        val_tiles=list(val_tiles),
+        threshold=best_threshold,
+        precision=float(prec),
+        recall=float(rec),
+        f1=float(f1),
+        iou=float(iou),
+        pr_auc=float(pr_auc),
+        n_val_rows=int(len(y_full)),
+        n_val_positives=int(y_full.sum()),
+        per_region=region_breakdown,
+    )
+    importances = dict(zip(X_tr.columns, model.booster_.feature_importance(importance_type="gain")))
+    confusion = {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
+    return metrics, importances, confusion, info, per_tile
+
+
 def _aggregate_region(folds: list[FoldMetrics]) -> dict[str, dict[str, float]]:
     regions: dict[str, dict[str, float]] = {}
     for fold in folds:
@@ -224,6 +344,8 @@ def _write_report(
     positive_threshold: float,
     git_sha: str,
     split_source: Path | None,
+    ungated: bool = False,
+    per_tile_ungated: dict[str, dict[str, object]] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     thresholds = [f.threshold for f in folds]
@@ -238,8 +360,20 @@ def _write_report(
     worst_region = min(regions.items(), key=lambda kv: kv[1]["f1_mean"])
 
     lines: list[str] = []
-    lines.append("# Baseline v1 — cross-validation results")
+    heading = (
+        "# Baseline v1 — cross-validation results (**ungated**, full-raster)"
+        if ungated
+        else "# Baseline v1 — cross-validation results"
+    )
+    lines.append(heading)
     lines.append("")
+    if ungated:
+        lines.append(
+            "> Eval scored every pixel of each held-out tile. Pixels outside "
+            "Cini's `train_mask` were labelled `0`. Numbers here track the "
+            "leaderboard setup; gated results live in the sibling report."
+        )
+        lines.append("")
     lines.append(f"- Git SHA: `{git_sha}`")
     lines.append(
         f"- Split source: `{split_source.relative_to(REPO_ROOT) if split_source else 'MGRS-prefix fallback'}`"
@@ -303,6 +437,20 @@ def _write_report(
     for i, (name, gain) in enumerate(top_features, start=1):
         lines.append(f"| {i} | `{name}` | {gain:,.1f} |")
     lines.append("")
+    if ungated and per_tile_ungated:
+        lines.append("## Per-tile sanity (ungated, on held-out fold)")
+        lines.append("")
+        lines.append(
+            "| tile | region | n_pixels | train_mask pixels | positives | fraction @ proba≥0.5 |"
+        )
+        lines.append("| --- | --- | ---: | ---: | ---: | ---: |")
+        for tile_id, stats in sorted(per_tile_ungated.items()):
+            lines.append(
+                f"| {tile_id} | {stats['region_id']} | {stats['n_pixels']} | "
+                f"{stats['n_train_mask']} | {stats['n_positive']} | "
+                f"{stats['positive_fraction_at_05']:.4f} |"
+            )
+        lines.append("")
     lines.append("## Training configuration")
     lines.append("")
     lines.append("```json")
@@ -332,6 +480,8 @@ def run_cv(
     positive_threshold: float,
     report_path: Path,
     split_source: Path | None,
+    ungated: bool = False,
+    manifest: pd.DataFrame | None = None,
 ) -> tuple[list[FoldMetrics], list[dict[str, int]]]:
     df = load_training_dataframe(tile_ids)
     df = df[df["tile_id"].isin(fold_assignments["tile_id"])].reset_index(drop=True)
@@ -339,11 +489,22 @@ def run_cv(
     folds: list[FoldMetrics] = []
     confusions: list[dict[str, int]] = []
     importance_lists: list[dict[str, float]] = []
+    per_tile_ungated: dict[str, dict[str, object]] = {}
+
+    if ungated and manifest is None:
+        raise ValueError("ungated mode requires the tile manifest")
+
     for fold_id in fold_ids:
-        logger.info("running fold %d", fold_id)
-        metrics, importance, confusion, info = run_fold(
-            df, fold_id, fold_assignments, config, positive_threshold
-        )
+        logger.info("running fold %d (%s)", fold_id, "ungated" if ungated else "gated")
+        if ungated:
+            metrics, importance, confusion, info, per_tile = run_fold_ungated(
+                df, fold_id, fold_assignments, config, positive_threshold, manifest
+            )
+            per_tile_ungated.update(per_tile)
+        else:
+            metrics, importance, confusion, info = run_fold(
+                df, fold_id, fold_assignments, config, positive_threshold
+            )
         logger.info(
             "fold %d: F1=%.3f  IoU=%.3f  PR-AUC=%.3f  thr=%.3f  (val rows=%d, positives=%d, best_iter=%s)",
             fold_id,
@@ -369,6 +530,8 @@ def run_cv(
         positive_threshold,
         _git_sha(),
         split_source,
+        ungated=ungated,
+        per_tile_ungated=per_tile_ungated if ungated else None,
     )
     _write_threshold_sidecar(folds, report_path.with_name(report_path.stem + "_thresholds.json"))
     logger.info("wrote report -> %s", report_path)
@@ -399,6 +562,14 @@ def main() -> int:
     parser.add_argument("--num-leaves", type=int, default=TrainConfig.num_leaves)
     parser.add_argument("--seed", type=int, default=TrainConfig.seed)
     parser.add_argument(
+        "--ungated",
+        action="store_true",
+        help=(
+            "Score over the full held-out raster (pixels outside train_mask "
+            "labelled 0) — matches the leaderboard framing."
+        ),
+    )
+    parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     args = parser.parse_args()
@@ -423,6 +594,8 @@ def main() -> int:
         seed=args.seed,
     )
     split_source = SPLIT_ASSIGNMENTS_PATH if SPLIT_ASSIGNMENTS_PATH.exists() else None
+    if args.ungated and args.report_path == REPORTS_ROOT / "baseline_results.md":
+        args.report_path = REPORTS_ROOT / "baseline_results_ungated.md"
     run_cv(
         tile_ids=tile_ids,
         fold_assignments=fold_assignments,
@@ -430,6 +603,8 @@ def main() -> int:
         positive_threshold=args.positive_threshold,
         report_path=args.report_path,
         split_source=split_source,
+        ungated=args.ungated,
+        manifest=manifest if args.ungated else None,
     )
     return 0
 
