@@ -201,6 +201,93 @@ def predict_test_tile(
     }
 
 
+def emit_union_variant(
+    union_tag: str,
+    source_tags: list[str],
+    tile_ids: list[str],
+    manifest: pd.DataFrame,
+    morph_open: int = 1,
+    min_area_ha: float = 0.5,
+) -> dict:
+    """Union the per-tile binary rasters from multiple candidates into a new variant.
+
+    Reads the already-written ``artifacts/predictions_autoloop/<tag>/<tile>_binary.tif``
+    for each source tag, logical-ORs them, re-applies morphological cleanup
+    and Hansen gate (via the source rasters' existing gating), polygonises
+    with lossyear-mode time_step, and emits a combined GeoJSON. Sources
+    that don't have a raster for a given tile are skipped.
+    """
+    from src.data import resolve_tile_paths as _rt
+    from src.masks import forest_mask_2020
+
+    out_subm = SUBMISSION_ROOT / union_tag
+    out_raster = RASTER_ROOT / union_tag
+    tile_summaries: list[dict] = []
+
+    for tid in tile_ids:
+        union = None
+        ref_profile = None
+        used_sources: list[str] = []
+        for tag in source_tags:
+            p = RASTER_ROOT / tag / f"{tid}_binary.tif"
+            if not p.exists():
+                continue
+            with rasterio.open(p) as src:
+                arr = src.read(1).astype(bool)
+                if ref_profile is None:
+                    ref_profile = src.profile.copy()
+            union = arr if union is None else (union | arr)
+            used_sources.append(tag)
+        if union is None:
+            tile_summaries.append({"tile_id": tid, "skipped": "no source rasters"})
+            continue
+
+        # Re-apply Hansen gate defensively (each source already did so, but
+        # union could include pixels dilated by morphological close in one).
+        forest = forest_mask_2020(ref_profile)
+        union = union & forest
+        union = morphological_clean(union.astype(np.uint8), open_radius=morph_open).astype(bool)
+
+        positive_fraction = float(union.mean())
+        raster_path = out_raster / f"{tid}_binary.tif"
+        _write_binary_raster(union.astype(np.uint8), ref_profile, raster_path)
+
+        try:
+            _enforce_refusal_rule(
+                tid, positive_fraction, REFUSE_ABOVE_DEFAULT, REFUSE_BELOW_DEFAULT
+            )
+        except SubmissionRefusedError as err:
+            logger.warning("union %s / tile %s refused: %s", union_tag, tid, err)
+            tile_summaries.append({"tile_id": tid, "refused": True})
+            continue
+
+        lossyear_hw = hansen_lossyear_raster(ref_profile)
+        geojson_path = out_subm / f"{tid}.geojson"
+        try:
+            gj = _polygons_with_time_step(raster_path, lossyear_hw, min_area_ha, geojson_path)
+            n_polygons = len(gj.get("features", []))
+        except ValueError as err:
+            logger.warning("union %s / tile %s: no polygons (%s)", union_tag, tid, err)
+            n_polygons = 0
+
+        tile_summaries.append(
+            {
+                "tile_id": tid,
+                "sources": used_sources,
+                "positive_fraction": positive_fraction,
+                "n_polygons": int(n_polygons),
+            }
+        )
+
+    combined_path = combine_submission_geojsons(union_tag)
+    return {
+        "tag": union_tag,
+        "sources": source_tags,
+        "combined_geojson": str(combined_path.relative_to(REPO_ROOT)),
+        "tiles": tile_summaries,
+    }
+
+
 def combine_submission_geojsons(candidate_tag: str) -> Path:
     """Merge the per-tile GeoJSONs under submission/autoloop/<tag>/ into one."""
     in_dir = SUBMISSION_ROOT / candidate_tag

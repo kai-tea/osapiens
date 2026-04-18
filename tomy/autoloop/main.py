@@ -34,6 +34,7 @@ from .predict import (
     RASTER_ROOT,
     SUBMISSION_ROOT,
     combine_submission_geojsons,
+    emit_union_variant,
     predict_test_tile,
 )
 from .train import (
@@ -262,6 +263,18 @@ def run(
                     aef_drop_prob=0.75,
                 ),
             ),
+            # Cini-independent target: majority_2of3 AND Hansen forest_2020.
+            # Fewer positives, cleaner supervision, AEF dropped entirely.
+            (
+                "autoloop_majority_hansen",
+                TrainConfig(
+                    epochs=epochs,
+                    pos_weight=4.0,
+                    iou_weight=0.6,
+                    aef_drop_prob=1.0,
+                    target_mode="majority_hansen",
+                ),
+            ),
         ]
         for tag, cfg in configs:
             try:
@@ -348,6 +361,47 @@ def run(
                 )
         except Exception as err:
             logger.exception("self-training / ensemble stage failed: %s", err)
+
+        # any_signal: union the most reliable Cini-free heuristic with the
+        # best model, so we catch pixels either source alone missed. This
+        # is a hedge against Cini's labels being systematically wrong —
+        # Hansen + NDVI-S1 provide independent corroboration.
+        try:
+            manifest = load_tile_manifest()
+            best_model_tag = None
+            if model_stages:
+                scored = [s for s in model_stages if "cv_f1_mean" in s and "error" not in s]
+                if scored:
+                    best_model_tag = max(scored, key=lambda s: s["cv_f1_mean"])["tag"]
+
+            source_tags = [
+                "hansen_tc25_ly22to25_ts",   # recent Hansen lossyear with time_step
+                "ndvi_s1_drop_hansen",        # imagery-only change
+            ]
+            if best_model_tag:
+                source_tags.append(best_model_tag)
+
+            stage = emit_union_variant(
+                "any_signal",
+                source_tags=source_tags,
+                tile_ids=test_tiles,
+                manifest=manifest,
+                morph_open=1,
+            )
+            model_stages.append(
+                {
+                    "tag": stage["tag"],
+                    "combined_geojson": stage["combined_geojson"],
+                    "tiles": stage["tiles"],
+                    "note": (
+                        "union of Hansen lossyear recent + imagery NDVI+S1 drop"
+                        + (f" + {best_model_tag}" if best_model_tag else "")
+                        + " — no Cini dependency except through the model"
+                    ),
+                }
+            )
+        except Exception as err:
+            logger.exception("any_signal ensemble failed: %s", err)
 
     write_summary(heuristics, model_stages, naive_baselines)
     return 0

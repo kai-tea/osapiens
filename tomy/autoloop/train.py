@@ -63,6 +63,10 @@ class TrainConfig:
     epochs: int = DEFAULT_EPOCHS
     batch_size: int = DEFAULT_BATCH
     seed: int = 42
+    # "soft_target": Cini's soft-label binarisation (canonical).
+    # "majority_hansen": (majority_2of3 == 1) AND Hansen forest_2020 — stricter,
+    # Cini-fusion-independent, hedges against weak-label noise.
+    target_mode: str = "soft_target"
 
 
 @dataclass
@@ -150,6 +154,59 @@ def _predict_df(model: PixelMLP, X: np.ndarray, batch: int = 65536) -> np.ndarra
 
 
 _TILE_FEATURE_CACHE: dict[str, tuple[np.ndarray, dict, dict]] = {}
+
+
+def majority_hansen_target_for_frame(
+    df: pd.DataFrame, manifest: pd.DataFrame
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build (y, w) with target = (majority_2of3 AND Hansen forest_2020).
+
+    For each tile in ``df``, read Cini's labelpack, compute the
+    confident-alert count across RADD/GLAD-L/GLAD-S2, require ≥ 2 votes,
+    AND AND with Hansen forest_2020. Index at the parquet's (row, col)
+    positions. This target is Cini-fusion-independent (we re-derive
+    majority_2of3 from the alert channels she ships, not from her soft
+    label), and adds Hansen as an external veto against weak-label
+    noise on non-forest pixels.
+    """
+    from src.masks import forest_mask_2020
+    from src.naive import read_labelpack
+
+    y = np.zeros(len(df), dtype=np.float32)
+    w_out = df["sample_weight"].to_numpy().astype(np.float32).copy()
+
+    for tid, block in df.groupby("tile_id", sort=False):
+        pack = read_labelpack(tid)
+        votes = (
+            ((pack["radd_alert"] == 1) & (pack["radd_conf"] >= 0.5)).astype(np.int8)
+            + ((pack["gladl_alert"] == 1) & (pack["gladl_conf"] >= 0.5)).astype(np.int8)
+            + ((pack["glads2_alert"] == 1) & (pack["glads2_conf"] >= 0.5)).astype(np.int8)
+        )
+        paths = resolve_tile_paths(tid, manifest=manifest)
+        with rasterio.open(paths.s2_ref_path) as src:
+            ref_profile = src.profile.copy()
+        hansen = forest_mask_2020(ref_profile)
+        combined = ((votes >= 2) & hansen).astype(np.float32)
+
+        idx = block.index.to_numpy()
+        rows = block["row"].to_numpy()
+        cols = block["col"].to_numpy()
+        y[idx] = combined[rows, cols]
+
+    w_region = per_region_weights(df)
+    w = (w_out * w_region).astype(np.float32)
+    return y, w
+
+
+def _build_training_arrays(
+    df: pd.DataFrame, feats: list[str], cfg: TrainConfig, manifest: pd.DataFrame
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    X = df[feats].to_numpy().astype(np.float32)
+    if cfg.target_mode == "majority_hansen":
+        y, w = majority_hansen_target_for_frame(df, manifest)
+    else:
+        y, w = label_targets(df, POSITIVE_THRESHOLD)
+    return X, y, w
 
 
 def _get_tile_features(
@@ -295,8 +352,7 @@ def run_ungated_cv(
             val_tiles,
         )
         df = load_train_frame(train_tiles)
-        X = df[feats].to_numpy().astype(np.float32)
-        y, w = label_targets(df, POSITIVE_THRESHOLD)
+        X, y, w = _build_training_arrays(df, feats, cfg, manifest)
         model = _train_one(X, y, w, cfg, feats)
         result = _fold_eval(model, val_tiles, manifest, fold_id, treecover_threshold)
         logger.info(
@@ -316,8 +372,8 @@ def train_full(cfg: TrainConfig, tile_ids: list[str]) -> tuple[PixelMLP, dict]:
     """Train on all labeled tiles — no held-out fold. For test-tile inference."""
     df = load_train_frame(tile_ids)
     feats = feature_names()
-    X = df[feats].to_numpy().astype(np.float32)
-    y, w = label_targets(df, POSITIVE_THRESHOLD)
+    manifest = load_tile_manifest()
+    X, y, w = _build_training_arrays(df, feats, cfg, manifest)
     model = _train_one(X, y, w, cfg, feats)
     info = {
         "n_pixels": int(len(df)),

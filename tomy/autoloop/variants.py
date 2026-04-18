@@ -33,6 +33,7 @@ from src.predict import (
 )
 from src.submit_heuristic import heuristic_binary_raster
 
+from .change_detect import imagery_change_binary
 from .io import REPO_ROOT
 from .predict import (
     RASTER_ROOT,
@@ -49,26 +50,57 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Variant:
     tag: str
-    treecover_threshold: int
-    earliest_loss_year: int
-    latest_loss_year: int
-    morph_open: int
+    kind: str  # "hansen" | "ndvi" | "ndvi_s1"
+    treecover_threshold: int = 25
+    earliest_loss_year: int = LOSSYEAR_2020 + 1
+    latest_loss_year: int = 25
+    morph_open: int = 1
     min_area_ha: float = 0.5
 
 
 DEFAULT_VARIANTS = (
+    # --- Hansen-lossyear family (depends on GFC only; Cini-free) ---
     # Kaite's shipped baseline, refreshed with time_step.
-    Variant("hansen_tc25_ly21to25_ts", 25, LOSSYEAR_2020 + 1, 25, morph_open=1),
+    Variant("hansen_tc25_ly21to25_ts", "hansen", 25, LOSSYEAR_2020 + 1, 25, morph_open=1),
     # Higher recall (loosen canopy cover).
-    Variant("hansen_tc15_ly21to25_ts", 15, LOSSYEAR_2020 + 1, 25, morph_open=1),
+    Variant("hansen_tc15_ly21to25_ts", "hansen", 15, LOSSYEAR_2020 + 1, 25, morph_open=1),
     # Higher precision (tighter canopy).
-    Variant("hansen_tc35_ly21to25_ts", 35, LOSSYEAR_2020 + 1, 25, morph_open=1),
+    Variant("hansen_tc35_ly21to25_ts", "hansen", 35, LOSSYEAR_2020 + 1, 25, morph_open=1),
     # Recent-only (closer to the hidden-label window the grader likely uses).
-    Variant("hansen_tc25_ly22to25_ts", 25, LOSSYEAR_2020 + 2, 25, morph_open=1),
-    Variant("hansen_tc25_ly23to25_ts", 25, LOSSYEAR_2020 + 3, 25, morph_open=1),
+    Variant("hansen_tc25_ly22to25_ts", "hansen", 25, LOSSYEAR_2020 + 2, 25, morph_open=1),
+    Variant("hansen_tc25_ly23to25_ts", "hansen", 25, LOSSYEAR_2020 + 3, 25, morph_open=1),
     # No morphological cleanup — one polygon extra, costs FPR.
-    Variant("hansen_tc25_ly21to25_raw", 25, LOSSYEAR_2020 + 1, 25, morph_open=0),
+    Variant("hansen_tc25_ly21to25_raw", "hansen", 25, LOSSYEAR_2020 + 1, 25, morph_open=0),
+    # --- Imagery change-detection family (Cini-free, label-free) ---
+    # Pure NDVI drop on Hansen-gated forest.
+    Variant("ndvi_drop_hansen", "ndvi", 25, morph_open=1),
+    # NDVI drop AND S1 VV drop — tighter, lower FPR.
+    Variant("ndvi_s1_drop_hansen", "ndvi_s1", 25, morph_open=1),
 )
+
+
+def _compute_variant_binary(
+    variant: Variant, tile_id: str, manifest: pd.DataFrame
+) -> tuple[np.ndarray, dict]:
+    """Return (H, W) boolean mask + ref_profile for the chosen variant kind."""
+    paths = resolve_tile_paths(tile_id, manifest=manifest)
+    with rasterio.open(paths.s2_ref_path) as src:
+        ref_profile = src.profile.copy()
+
+    if variant.kind == "hansen":
+        binary, _ff, _lf = heuristic_binary_raster(
+            ref_profile,
+            treecover_threshold=variant.treecover_threshold,
+            earliest_loss_year=variant.earliest_loss_year,
+            latest_loss_year=variant.latest_loss_year,
+        )
+    elif variant.kind == "ndvi":
+        binary, _rp, _stats = imagery_change_binary(tile_id, manifest, require_s1_agreement=False)
+    elif variant.kind == "ndvi_s1":
+        binary, _rp, _stats = imagery_change_binary(tile_id, manifest, require_s1_agreement=True)
+    else:
+        raise ValueError(f"unknown variant kind: {variant.kind}")
+    return binary.astype(bool), ref_profile
 
 
 def emit_variant(
@@ -81,16 +113,7 @@ def emit_variant(
     """Produce one variant's per-tile rasters + GeoJSONs + combined merge."""
     tile_summaries: list[dict] = []
     for tid in tile_ids:
-        paths = resolve_tile_paths(tid, manifest=manifest)
-        with rasterio.open(paths.s2_ref_path) as src:
-            ref_profile = src.profile.copy()
-
-        binary, _ff, _lf = heuristic_binary_raster(
-            ref_profile,
-            treecover_threshold=variant.treecover_threshold,
-            earliest_loss_year=variant.earliest_loss_year,
-            latest_loss_year=variant.latest_loss_year,
-        )
+        binary, ref_profile = _compute_variant_binary(variant, tid, manifest)
         if variant.morph_open > 0:
             binary = morphological_clean(binary.astype(np.uint8), variant.morph_open).astype(bool)
 
@@ -130,6 +153,7 @@ def emit_variant(
     combined_path = combine_submission_geojsons(variant.tag)
     return {
         "tag": variant.tag,
+        "kind": variant.kind,
         "treecover_threshold": variant.treecover_threshold,
         "earliest_loss_year": variant.earliest_loss_year,
         "latest_loss_year": variant.latest_loss_year,
