@@ -1,0 +1,5 @@
+owner: tomy
+model_name: tomy_starter
+active_fold: 0
+target_column: soft_target
+weight_column: sample_weight
