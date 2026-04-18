@@ -1,6 +1,13 @@
 # Baseline v1 — handoff to Kaite
 
-_Run of 2026-04-18; code at `feature/kaite` HEAD. Headline numbers below are cross-validated on Cini's fold split but optimistic (see "Known weaknesses"); polygon-level leaderboard score will be lower._
+> **DO NOT SUBMIT `submission/baseline_v1/`.** Two of five test tiles
+> (`47QMA_6_2` at 99.3%, `48PWA_0_6` at 99.6% positive) are broken in
+> ways that will tank any metric that penalises false positives. The
+> pipeline, eval plumbing, and GeoJSON outputs are structurally correct
+> — the model is not production-usable. v2 is required before any
+> leaderboard upload.
+
+_Run of 2026-04-18; code at `feature/kaite` HEAD._
 
 ## What was built
 
@@ -95,20 +102,20 @@ training config.
 
 ## Known weaknesses
 
-- **Optimistic CV F1**: 0.97 is not a leaderboard-equivalent number.
-  `train_mask == 1` restricts eval to pixels where *some* source
-  observed the land with `obs_count ≥ 2`, which heavily biases toward
-  the alert frontier. The classifier is not being asked to score empty
-  background. Expect polygon IoU at submission time to be materially
-  lower.
-- **Catastrophic regional calibration failure on SE Asia** — the
-  headline issue. Test tiles `47QMA_6_2` and `48PWA_0_6` predict
-  99.3% and 99.6% positive. Root cause: training positive rate in
-  47Q/48P tiles is very high (those tiles miss GLAD-S2, so
-  `soft_target ≥ 0.5` fires whenever RADD+GLAD-L agree, which is
-  frequent in actively-deforested areas). The mean threshold 0.435 is
-  then too low for the test tiles' wider geographic distribution.
-  Fixing this is the **#1 priority for v2** — see "What to try next".
+- **The CV metric measures the wrong task**. F1=0.968 answers
+  "given this pixel was labelable (weak sources agreed enough to gate
+  it through `train_mask == 1`), did we call it deforestation?". The
+  leaderboard asks "for every pixel in a 1000×1000 tile, is this
+  deforestation?". Those are different problems. The classifier was
+  implicitly trained on the gated task and blows up when asked to score
+  ungated pixels — that's precisely what the test-tile failure shows.
+  Honest eval requires scoring over all pixels with ungated labels;
+  see v2 priority #2.
+- **SE-Asia test tiles are broken, not miscalibrated**. `47QMA_6_2`
+  99.3%, `48PWA_0_6` 99.6% positive. A forest tile cannot be 99%
+  deforested in five years. This is not a threshold issue — the model
+  is extrapolating into an embedding region it was never trained on
+  and picking "positive" as the safe bet. See v2 priority #1.
 - **Zero hard negatives**: Cini's synthesis only produces `hard_label`
   on pixels with `obs_count == 3` and zero source alerts — impossible
   for the 8 MGRS-47/48 SE-Asia tiles that lack GLAD-S2 coverage. Hence
@@ -124,9 +131,14 @@ training config.
 - **Small training tiles are thin**: `18NWM_9_4` has 1,092 `train_mask`
   pixels, `18NYH_9_9` has 16 — fold metrics on those tiles are noisy
   by construction (both score 0.000).
-- **AEF dominates the model**: all top-20 features are AEF embeddings;
-  no S1 or S2 temporal stats survive. The foundation model has
-  internalised the signal we were engineering by hand.
+- **AEF dominance on CV is a trap, not a win**. Top-20 features are
+  all AEF embeddings — but that's importance on the *gated* CV, where
+  AEF has the easy signal. On the OOD test tiles AEF is precisely what
+  extrapolates wildly (its embedding manifold is region-specific and
+  the test distribution isn't on it). S1 and S2 temporal change
+  signals are physically grounded and region-agnostic; they are the
+  best candidate to save generalisation, not dead weight. **Do not
+  prune them.**
 - **No cloud masking for S2**: nodata pixels are set to NaN
   (LightGBM handles natively) but partly-cloudy scenes are not
   explicitly filtered.
@@ -136,37 +148,46 @@ training config.
   tiles avoids this; the shipped `submission/baseline_v1/summary.json`
   was reconstructed manually from the worker logs.
 
-## What to try next (ordered by expected leaderboard impact)
+## v2 priorities — reviewed order
 
-1. **Fix the SE-Asia over-prediction — per-region threshold
-   calibration**. The 99.3% / 99.6% positive fractions on `47QMA_6_2`
-   and `48PWA_0_6` are the single biggest leaderboard risk. Fit one
-   threshold per MGRS-prefix group on each held-out fold's positives,
-   store as `baseline_results_thresholds.json` → `per_region`, and
-   route `src/predict.py` by tile's `region_id`. Fallback to the
-   current mean threshold for unseen prefixes (e.g. 33N).
-2. **Drop `train_mask` restriction during eval**. The high CV F1 is
-   an artefact of only scoring on the alert frontier. Re-run eval
-   against a full-tile held-out raster (predict everywhere, compute
-   IoU vs `hard_label == 1` after excluding `hard_label == 255`) to
-   get a number that tracks the leaderboard.
-3. **Regress on `soft_target` with `LGBMRegressor`** instead of the
-   0.5 binarisation. Uses all of Cini's confidence information and
-   avoids the single-threshold-at-training-time lossiness. Evaluate
-   against both the soft target (MSE) and the hard-0.5 binarisation
-   (F1).
-4. **Time-of-event head**: the `event_year` sidecar is already in the
-   parquet. A second `LGBMRegressor` against positive-pixel `event_year`
-   unlocks the "predict *when* deforestation occurred" bonus for
-   minimal additional training cost; preserving the column in
-   `data.py` was intentional for this.
-5. **Prune S1 + S2 temporal features**. Top-20 importances use zero of
-   them; dropping all 210 S1+S2 features (keep just the 192 AEF dims)
-   should cut training time ~5× and memory ~2× without hurting
-   accuracy. Fast to ablate.
-6. **Visualisation tool**: a small Folium or Streamlit viewer of
-   (S2 RGB, AEF PCA, prediction, weak-label overlay) per test tile
-   would directly feed the presentation rubric axis. Cheap bonus points.
+1. **Forest-in-2020 gate at inference.** Hard mask: any pixel that
+   wasn't forest in 2020 gets `prediction = 0`. Use S2 NDVI in 2020
+   with a threshold (fast, in-repo), or a public 2020 forest-cover
+   product (Hansen GFC, ESA WorldCover). This alone probably fixes
+   `47QMA_6_2` and `48PWA_0_6` because most of those "positive"
+   pixels aren't even forest.
+2. **Honest eval without `train_mask` gating.** Re-run `src/eval.py`
+   with predictions over the full held-out raster; label any pixel
+   outside `train_mask` as `0` (true-negative for scoring). The
+   resulting F1 is the number to trust — expect it materially below
+   0.968.
+3. **Keep S1 and S2 features. Reconsider AEF.** Current importance
+   ranking inverts what generalises. S1 VV / S2 temporal stats are
+   physically grounded change signals; AEF is a learned embedding
+   whose manifold doesn't cover the test distribution. Ablate by
+   training (a) AEF-only, (b) S1+S2-only, (c) both, and compare on
+   the *ungated* eval from step 2. Consider per-tile AEF
+   normalisation to neutralise manifold shift.
+4. **Submission sanity-check / refusal rule.** Reject any test tile
+   whose `positive_fraction` falls outside `[0.0001, 0.10]` pending
+   manual inspection. Deforestation rates in a single 5-year window
+   rarely exceed ~10% of a tile's area. Cheap to add to `predict.py`.
+5. **Visual QA loop.** Before any further submission, render each
+   test tile as Sentinel-2 RGB + prediction overlay (Folium,
+   Streamlit, or static PNGs). The two broken tiles here are obvious
+   from a glance; don't ship what hasn't been looked at. Doubles as
+   presentation-rubric material.
+6. **Per-region stratified training.** If training has 2 S-America
+   tiles for every SE-Asia tile, the model's prior is South America.
+   Sample-weight per MGRS prefix (e.g. inverse region frequency) so
+   each region contributes equally.
+7. **Per-region threshold calibration.** Still useful, but *only
+   after* steps 1–5. On its own it can't rescue a model that's
+   extrapolating.
+8. **Time-of-event bonus head.** The `event_year` sidecar is already
+   in the parquet. A second `LGBMRegressor` against positive-pixel
+   `event_year` unlocks the "predict *when* deforestation occurred"
+   bonus once the main model is trustworthy.
 
 ## Reproduction
 
