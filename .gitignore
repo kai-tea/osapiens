@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# IDEs
+.idea/
+.vscode/
+
+# Output directories
+data/
+content/
+reports/
+splits/
+
+# Logs
+*.log
+.claude/
