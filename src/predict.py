@@ -27,6 +27,7 @@ import rasterio
 from submission_utils import raster_to_geojson
 
 from .data import build_tile_features, feature_names, load_tile_manifest, resolve_tile_paths
+from .masks import DEFAULT_TREECOVER_THRESHOLD, forest_mask_2020
 from .train import MODELS_ROOT, DEFAULT_MODEL_NAME
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,31 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PREDICTIONS_ROOT = REPO_ROOT / "artifacts" / "predictions_v1"
 SUBMISSION_ROOT = REPO_ROOT / "submission" / "baseline_v1"
 DEFAULT_THRESHOLDS_PATH = REPO_ROOT / "reports" / "baseline_results_thresholds.json"
+
+REFUSE_ABOVE_DEFAULT = 0.10
+REFUSE_BELOW_DEFAULT = 5e-5
+
+
+class SubmissionRefusedError(RuntimeError):
+    """Raised when a tile's positive fraction falls outside the sanity range."""
+
+
+def _enforce_refusal_rule(
+    tile_id: str,
+    positive_fraction: float,
+    refuse_above: float,
+    refuse_below: float,
+) -> None:
+    if positive_fraction > refuse_above:
+        raise SubmissionRefusedError(
+            f"tile {tile_id}: positive_fraction={positive_fraction:.4f} "
+            f"exceeds sanity upper bound {refuse_above:.4f}; refusing to write GeoJSON"
+        )
+    if positive_fraction < refuse_below:
+        raise SubmissionRefusedError(
+            f"tile {tile_id}: positive_fraction={positive_fraction:.2e} "
+            f"below sanity lower bound {refuse_below:.2e}; refusing to write GeoJSON"
+        )
 
 
 def load_model(model_dir: Path, name: str) -> tuple[lgb.Booster, dict]:
@@ -82,8 +108,20 @@ def predict_tile(
     submission_output_dir: Path,
     min_area_ha: float,
     manifest: pd.DataFrame | None = None,
+    forest_gate: bool = True,
+    treecover_threshold: int = DEFAULT_TREECOVER_THRESHOLD,
+    refuse_above: float = REFUSE_ABOVE_DEFAULT,
+    refuse_below: float = REFUSE_BELOW_DEFAULT,
 ) -> dict:
-    """Produce a binary prediction raster and submission GeoJSON for one tile."""
+    """Produce a binary prediction raster and submission GeoJSON for one tile.
+
+    When ``forest_gate`` is ``True`` the binarised predictions are ``AND``'d
+    with the Hansen GFC 2020 forest mask before polygonisation. The
+    submission refusal rule (``refuse_above`` / ``refuse_below``) guards
+    against the pathological all-positive / all-negative tiles shown in
+    v1; the function raises :class:`SubmissionRefusedError` rather than
+    writing a GeoJSON whose positive fraction falls outside the range.
+    """
     paths = resolve_tile_paths(tile_id, manifest=manifest)
     logger.info("tile %s: extracting features", tile_id)
     features, names, _labels, ref_profile = build_tile_features(paths)
@@ -97,12 +135,22 @@ def predict_tile(
     logger.info("tile %s: predicting %d pixels", tile_id, X.shape[0])
     proba = booster.predict(X)
     binary = (proba >= threshold).astype(np.uint8).reshape(H, W)
+    positive_fraction_raw = float(binary.mean())
+
+    forest_fraction: float | None = None
+    if forest_gate:
+        logger.info("tile %s: applying Hansen GFC 2020 forest gate", tile_id)
+        forest = forest_mask_2020(ref_profile, treecover_threshold=treecover_threshold)
+        binary = (binary.astype(bool) & forest).astype(np.uint8)
+        forest_fraction = float(forest.mean())
     positive_fraction = float(binary.mean())
 
     raster_path = raster_output_dir / f"{tile_id}_binary.tif"
     _write_binary_raster(binary, ref_profile, raster_path)
 
     geojson_path = submission_output_dir / f"{tile_id}.geojson"
+    _enforce_refusal_rule(tile_id, positive_fraction, refuse_above, refuse_below)
+
     geojson: dict | None = None
     n_polygons = 0
     try:
@@ -114,7 +162,9 @@ def predict_tile(
     return {
         "tile_id": tile_id,
         "n_pixels": int(H * W),
+        "positive_fraction_before_gate": positive_fraction_raw,
         "positive_fraction": positive_fraction,
+        "forest_fraction": forest_fraction,
         "raster_path": str(raster_path.relative_to(REPO_ROOT)),
         "geojson_path": str(geojson_path.relative_to(REPO_ROOT))
         if geojson is not None
@@ -158,6 +208,35 @@ def main() -> int:
     )
     parser.add_argument("--min-area-ha", type=float, default=0.5)
     parser.add_argument(
+        "--forest-gate",
+        choices=["hansen", "none"],
+        default="hansen",
+        help="Apply Hansen GFC 2020 forest mask before polygonising",
+    )
+    parser.add_argument(
+        "--treecover-threshold",
+        type=int,
+        default=DEFAULT_TREECOVER_THRESHOLD,
+        help="Minimum Hansen treecover2000 (percent) to count as forest",
+    )
+    parser.add_argument(
+        "--refuse-above",
+        type=float,
+        default=REFUSE_ABOVE_DEFAULT,
+        help="Refuse tile whose positive fraction exceeds this (raises)",
+    )
+    parser.add_argument(
+        "--refuse-below",
+        type=float,
+        default=REFUSE_BELOW_DEFAULT,
+        help="Refuse tile whose positive fraction is below this (raises)",
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="Continue to the next tile on refusal instead of aborting the whole run",
+    )
+    parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     args = parser.parse_args()
@@ -185,15 +264,28 @@ def main() -> int:
 
     summaries: list[dict] = []
     for tile_id in tile_ids:
-        summary = predict_tile(
-            tile_id=tile_id,
-            booster=booster,
-            threshold=threshold,
-            raster_output_dir=args.raster_output_dir,
-            submission_output_dir=args.submission_output_dir,
-            min_area_ha=args.min_area_ha,
-            manifest=manifest,
-        )
+        try:
+            summary = predict_tile(
+                tile_id=tile_id,
+                booster=booster,
+                threshold=threshold,
+                raster_output_dir=args.raster_output_dir,
+                submission_output_dir=args.submission_output_dir,
+                min_area_ha=args.min_area_ha,
+                manifest=manifest,
+                forest_gate=args.forest_gate == "hansen",
+                treecover_threshold=args.treecover_threshold,
+                refuse_above=args.refuse_above,
+                refuse_below=args.refuse_below,
+            )
+        except SubmissionRefusedError as err:
+            logger.error("%s", err)
+            summaries.append(
+                {"tile_id": tile_id, "refused": True, "reason": str(err)}
+            )
+            if not args.keep_going:
+                raise
+            continue
         logger.info(
             "tile %s: positive_fraction=%.4f polygons=%d",
             tile_id,
