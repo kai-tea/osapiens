@@ -88,11 +88,29 @@ def combine_weak_labels(source_masks: dict[str, np.ndarray]) -> np.ndarray:
     return labels
 
 
-def _jrc_tile_name(lat_top: int, lon_left: int) -> str:
-    """Return the JRC filename for a 10x10 degree tile."""
+def _jrc_tile_name_candidates(lat_top: int, lon_left: int) -> list[str]:
+    """Return possible JRC filenames for one 10x10 degree tile."""
     ns = "N" if lat_top >= 0 else "S"
     ew = "E" if lon_left >= 0 else "W"
-    return f"JRC_GFC2020_V3_{ns}{abs(lat_top):02d}_{ew}{abs(lon_left):02d}.tif"
+    lat_token = f"{ns}{abs(lat_top):02d}"
+    lon_value = abs(lon_left)
+    lon_tokens = [f"{ew}{lon_value:02d}"]
+
+    padded_lon_token = f"{ew}{lon_value:03d}"
+    if padded_lon_token not in lon_tokens:
+        lon_tokens.append(padded_lon_token)
+
+    return [f"JRC_GFC2020_V3_{lat_token}_{lon_token}.tif" for lon_token in lon_tokens]
+
+
+def _resolve_jrc_tile_path(jrc_root: Path, lat_top: int, lon_left: int) -> tuple[Path | None, list[str], str | None]:
+    """Resolve one JRC tile path while supporting multiple filename conventions."""
+    candidate_names = _jrc_tile_name_candidates(lat_top, lon_left)
+    for candidate_name in candidate_names:
+        candidate_path = jrc_root / candidate_name
+        if candidate_path.exists():
+            return candidate_path, candidate_names, candidate_name
+    return None, candidate_names, None
 
 
 def _tiles_covering_bbox_4326(
@@ -126,7 +144,13 @@ def load_jrc_forest_mask(reference_meta: dict) -> tuple[np.ndarray | None, dict[
     """Load a boolean JRC forest mask aligned to the embedding grid if JRC is available."""
     jrc_root = _find_jrc_root()
     if jrc_root is None:
-        return None, {"jrc_available": False, "jrc_root": None, "forest_fraction": None}
+        return None, {
+            "jrc_available": False,
+            "jrc_root": None,
+            "forest_fraction": None,
+            "used_jrc_files": [],
+            "missing_jrc_candidates": [],
+        }
 
     left, bottom, right, top = array_bounds(
         reference_meta["height"],
@@ -145,22 +169,40 @@ def load_jrc_forest_mask(reference_meta: dict) -> tuple[np.ndarray | None, dict[
     needed_tiles = _tiles_covering_bbox_4326(lon_min, lat_min, lon_max, lat_max)
 
     aligned_layers = []
+    used_jrc_files: list[str] = []
+    missing_jrc_candidates: list[dict[str, object]] = []
     for lat_top, lon_left in needed_tiles:
-        path = jrc_root / _jrc_tile_name(lat_top, lon_left)
-        if not path.exists():
+        path, candidate_names, matched_name = _resolve_jrc_tile_path(jrc_root, lat_top, lon_left)
+        if path is None:
+            missing_jrc_candidates.append(
+                {
+                    "lat_top": lat_top,
+                    "lon_left": lon_left,
+                    "candidate_names": candidate_names,
+                }
+            )
             continue
         raster, meta = read_single_band(path)
         aligned = reproject_to_match(raster, meta, reference_meta)
         aligned_layers.append(aligned > 0)
+        used_jrc_files.append(matched_name if matched_name is not None else path.name)
 
     if not aligned_layers:
-        return None, {"jrc_available": False, "jrc_root": str(jrc_root), "forest_fraction": None}
+        return None, {
+            "jrc_available": False,
+            "jrc_root": str(jrc_root),
+            "forest_fraction": None,
+            "used_jrc_files": [],
+            "missing_jrc_candidates": missing_jrc_candidates,
+        }
 
     forest_mask = np.logical_or.reduce(aligned_layers)
     return forest_mask, {
         "jrc_available": True,
         "jrc_root": str(jrc_root),
         "forest_fraction": float(forest_mask.mean()),
+        "used_jrc_files": used_jrc_files,
+        "missing_jrc_candidates": missing_jrc_candidates,
     }
 
 
