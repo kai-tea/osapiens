@@ -17,8 +17,6 @@ if __package__ in {None, ""}:
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-from submission_utils import raster_to_geojson
-
 
 DEFAULT_INPUT_PREDICTION_DIR = Path("~/osapiens/artifacts/predictions_autoloop/autoloop_recall").expanduser()
 DEFAULT_JRC_DIR = Path("~/jrc_gfc2020").expanduser()
@@ -267,6 +265,13 @@ def apply_forest_mask(
 
 def export_tile_submission(masked_raster: Path, output_geojson: Path, min_area_ha: float) -> dict[str, object]:
     """Convert one masked raster into challenge-format GeoJSON."""
+    try:
+        from submission_utils import raster_to_geojson
+    except ModuleNotFoundError as exc:
+        if exc.name == "geopandas":
+            raise ModuleNotFoundError("geopandas required for submission export") from exc
+        raise
+
     try:
         geojson = raster_to_geojson(masked_raster, output_path=output_geojson, min_area_ha=min_area_ha)
         export_mode = "polygonized"
