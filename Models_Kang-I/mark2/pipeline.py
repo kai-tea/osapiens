@@ -11,20 +11,27 @@ try:
     from .labels.weak_labels import build_combined_labels, build_valid_training_mask, summarize_label_counts
     from .preprocessing.embeddings import (
         compute_channel_statistics,
-        extract_pixel_features,
+        extract_temporal_pixel_features,
         normalize_embedding,
         save_normalization_statistics,
     )
-    from .utils.io import infer_latest_common_year, load_embedding, list_tiles_for_year, split_training_tiles
+    from .utils.io import (
+        available_years_by_split,
+        choose_baseline_year,
+        infer_latest_common_year,
+        load_embedding,
+        list_tiles_for_year,
+        split_training_tiles,
+    )
 except ImportError:
     from labels.weak_labels import build_combined_labels, build_valid_training_mask, summarize_label_counts
     from preprocessing.embeddings import (
         compute_channel_statistics,
-        extract_pixel_features,
+        extract_temporal_pixel_features,
         normalize_embedding,
         save_normalization_statistics,
     )
-    from utils.io import infer_latest_common_year, load_embedding, list_tiles_for_year, split_training_tiles
+    from utils.io import available_years_by_split, choose_baseline_year, infer_latest_common_year, load_embedding, list_tiles_for_year, split_training_tiles
 
 
 def prepare_tile_artifact(
@@ -32,20 +39,29 @@ def prepare_tile_artifact(
     tile_id: str,
     split: str,
     year: int,
+    years_by_tile: dict[str, set[int]],
     mean: np.ndarray,
     std: np.ndarray,
     include_labels: bool,
 ) -> dict[str, np.ndarray | str | int | dict[str, object]]:
     """Prepare normalized features and optional weak labels for one tile."""
-    embedding, embedding_meta = load_embedding(data_root=data_root, tile_id=tile_id, split=split, year=year)
-    normalized_embedding = normalize_embedding(embedding, mean=mean, std=std)
-    features = extract_pixel_features(normalized_embedding)
+    current_embedding, embedding_meta = load_embedding(data_root=data_root, tile_id=tile_id, split=split, year=year)
+    baseline_year = choose_baseline_year(years_by_tile.get(tile_id), current_year=year)
+    baseline_embedding, _ = load_embedding(data_root=data_root, tile_id=tile_id, split=split, year=baseline_year)
+
+    normalized_current_embedding = normalize_embedding(current_embedding, mean=mean, std=std)
+    normalized_baseline_embedding = normalize_embedding(baseline_embedding, mean=mean, std=std)
+    features = extract_temporal_pixel_features(
+        normalized_baseline_embedding=normalized_baseline_embedding,
+        normalized_current_embedding=normalized_current_embedding,
+    )
 
     # Extension point: image + embedding multimodal fusion can be added here later.
     artifact: dict[str, np.ndarray | str | int | dict[str, object]] = {
         "tile_id": tile_id,
         "split": split,
         "year": year,
+        "baseline_year": baseline_year,
         "features": features,
     }
 
@@ -134,6 +150,43 @@ def finalize_label_gating_totals(totals: dict[str, int | float]) -> dict[str, in
     }
 
 
+def initialize_temporal_feature_totals() -> dict[str, int | list[int]]:
+    """Create an empty accumulator for split-level temporal feature diagnostics."""
+    return {
+        "same_year_fallback_tiles": 0,
+        "baseline_years_used": [],
+    }
+
+
+def update_temporal_feature_totals(
+    totals: dict[str, int | list[int]],
+    artifact: dict[str, np.ndarray | str | int | dict[str, object]],
+) -> None:
+    """Accumulate split-level temporal feature diagnostics from one tile."""
+    current_year = int(artifact["year"])
+    baseline_year = int(artifact["baseline_year"])
+    if baseline_year == current_year:
+        totals["same_year_fallback_tiles"] += 1
+    totals["baseline_years_used"].append(baseline_year)
+
+
+def finalize_temporal_feature_totals(
+    totals: dict[str, int | list[int]],
+    current_year: int,
+    input_dim: int,
+    output_dim: int,
+) -> dict[str, object]:
+    """Convert accumulated temporal feature totals into a JSON-friendly split summary."""
+    baseline_years_used = sorted({int(year) for year in totals["baseline_years_used"]})
+    return {
+        "current_year": current_year,
+        "input_dim_before": input_dim,
+        "input_dim_after": output_dim,
+        "baseline_years_used": baseline_years_used,
+        "same_year_fallback_tiles": int(totals["same_year_fallback_tiles"]),
+    }
+
+
 def save_tile_artifact(artifact: dict[str, np.ndarray | str | int], output_path: Path) -> None:
     """Persist one tile artifact as a compressed NumPy archive."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -178,6 +231,10 @@ def run_embedding_label_pipeline(
         pixel_count=int(stats["pixel_count"][0]),
     )
 
+    years_by_split = {"train": available_years_by_split(data_root, split="train")}
+    if include_test:
+        years_by_split["test"] = available_years_by_split(data_root, split="test")
+
     split_plan: list[tuple[str, list[str], str, bool]] = [
         ("train", fit_tiles, "train", True),
         ("validation", validation_tiles, "train", True),
@@ -188,15 +245,20 @@ def run_embedding_label_pipeline(
 
     summaries: dict[str, dict[str, int]] = {}
     label_gating_summaries: dict[str, dict[str, int | float | None]] = {}
+    temporal_feature_summaries: dict[str, dict[str, object]] = {}
+    feature_input_dim = int(stats["mean"].shape[0])
+    feature_output_dim = feature_input_dim * 3
     for output_split, tile_ids, data_split, include_labels in split_plan:
         totals = {"positive": 0, "negative": 0, "uncertain": 0}
         gating_totals = initialize_label_gating_totals()
+        temporal_totals = initialize_temporal_feature_totals()
         for tile_id in tile_ids:
             artifact = prepare_tile_artifact(
                 data_root=data_root,
                 tile_id=tile_id,
                 split=data_split,
                 year=selected_year,
+                years_by_tile=years_by_split[data_split],
                 mean=stats["mean"],
                 std=stats["std"],
                 include_labels=include_labels,
@@ -214,10 +276,17 @@ def run_embedding_label_pipeline(
                 label_diagnostics = artifact.get("label_diagnostics")
                 if isinstance(label_diagnostics, dict):
                     update_label_gating_totals(gating_totals, label_diagnostics)
+            update_temporal_feature_totals(temporal_totals, artifact)
 
         summaries[output_split] = totals
         if include_labels:
             label_gating_summaries[output_split] = finalize_label_gating_totals(gating_totals)
+        temporal_feature_summaries[output_split] = finalize_temporal_feature_totals(
+            temporal_totals,
+            current_year=selected_year,
+            input_dim=feature_input_dim,
+            output_dim=feature_output_dim,
+        )
 
     summary_path = output_dir / "summary.json"
     summary_payload = {
@@ -227,6 +296,7 @@ def run_embedding_label_pipeline(
         "stats_path": str(stats_path),
         "summaries": summaries,
         "label_gating_summaries": label_gating_summaries,
+        "temporal_feature_summaries": temporal_feature_summaries,
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary_payload, indent=2))

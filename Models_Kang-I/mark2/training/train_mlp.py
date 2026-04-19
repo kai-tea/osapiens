@@ -20,13 +20,25 @@ try:
     from ..evaluation.report_predictions import load_labels_and_probabilities
     from ..models.mlp import build_mlp, save_model_checkpoint
     from ..utils.evaluation import DEFAULT_THRESHOLD_SWEEP, build_validation_report, save_json_report
-    from ..utils.npz_data import count_split_pixels, infer_input_dim_from_npz, iterate_eval_batches, iterate_training_batches
+    from ..utils.npz_data import (
+        count_split_pixels,
+        infer_input_dim_from_npz,
+        iterate_balanced_training_batches,
+        iterate_eval_batches,
+        iterate_training_batches,
+    )
     from ..utils.prediction import save_prediction_set
 except ImportError:
     from evaluation.report_predictions import load_labels_and_probabilities
     from models.mlp import build_mlp, save_model_checkpoint
     from utils.evaluation import DEFAULT_THRESHOLD_SWEEP, build_validation_report, save_json_report
-    from utils.npz_data import count_split_pixels, infer_input_dim_from_npz, iterate_eval_batches, iterate_training_batches
+    from utils.npz_data import (
+        count_split_pixels,
+        infer_input_dim_from_npz,
+        iterate_balanced_training_batches,
+        iterate_eval_batches,
+        iterate_training_batches,
+    )
     from utils.prediction import save_prediction_set
 
 
@@ -43,6 +55,9 @@ DEFAULT_BATCH_SIZE = 4096
 DEFAULT_EPOCHS = 20
 DEFAULT_SEED = 42
 DEFAULT_THRESHOLD = 0.5
+DEFAULT_POS_WEIGHT_SCALE = 1.5
+DEFAULT_SAMPLING_MODE = "balanced"
+DEFAULT_SELECTION_METRIC = "selected_threshold_f1"
 
 
 def set_deterministic_seed(seed: int) -> None:
@@ -70,13 +85,19 @@ def run_training_epoch(
     device: torch.device,
     epoch_index: int,
     seed: int,
+    sampling_mode: str,
 ) -> float:
     """Run one training epoch over all valid training pixels."""
     model.train()
     total_loss = 0.0
     total_examples = 0
 
-    for features_np, labels_np in iterate_training_batches(train_dir, batch_size=batch_size, epoch_seed=seed + epoch_index):
+    if sampling_mode == "balanced":
+        batch_iterator = iterate_balanced_training_batches(train_dir, batch_size=batch_size, epoch_seed=seed + epoch_index)
+    else:
+        batch_iterator = iterate_training_batches(train_dir, batch_size=batch_size, epoch_seed=seed + epoch_index)
+
+    for features_np, labels_np in batch_iterator:
         features = torch.from_numpy(features_np).to(device=device, dtype=torch.float32)
         labels = torch.from_numpy(labels_np).to(device=device, dtype=torch.float32)
 
@@ -138,7 +159,11 @@ def evaluate_model(
     }
 
 
-def compute_positive_class_weight(train_counts: dict[str, int], device: torch.device) -> torch.Tensor:
+def compute_positive_class_weight(
+    train_counts: dict[str, int],
+    device: torch.device,
+    scale: float,
+) -> tuple[torch.Tensor, float]:
     """Compute the positive class weight from split counts for weighted BCE."""
     positive_count = int(train_counts["positive"])
     negative_count = int(train_counts["negative"])
@@ -146,7 +171,9 @@ def compute_positive_class_weight(train_counts: dict[str, int], device: torch.de
         raise ValueError("Training split contains zero positive pixels; cannot compute pos_weight")
     if negative_count <= 0:
         raise ValueError("Training split contains zero negative pixels; cannot compute pos_weight")
-    return torch.tensor([negative_count / positive_count], dtype=torch.float32, device=device)
+    raw_pos_weight = negative_count / positive_count
+    scaled_pos_weight = raw_pos_weight * scale
+    return torch.tensor([scaled_pos_weight], dtype=torch.float32, device=device), raw_pos_weight
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -179,6 +206,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help="Mini-batch size.")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help="Number of training epochs.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Random seed for deterministic training.")
+    parser.add_argument(
+        "--pos_weight_scale",
+        type=float,
+        default=DEFAULT_POS_WEIGHT_SCALE,
+        help="Extra multiplier applied to the standard negative/positive BCE class weight.",
+    )
+    parser.add_argument(
+        "--sampling_mode",
+        type=str,
+        choices=("balanced", "uniform"),
+        default=DEFAULT_SAMPLING_MODE,
+        help="Training batch sampling strategy.",
+    )
     return parser
 
 
@@ -191,7 +231,11 @@ def main() -> None:
     input_dim = infer_input_dim_from_npz(args.train_dir)
     train_counts = count_split_pixels(args.train_dir)
     validation_counts = count_split_pixels(args.validation_dir)
-    pos_weight = compute_positive_class_weight(train_counts, device=device)
+    pos_weight, raw_pos_weight = compute_positive_class_weight(
+        train_counts,
+        device=device,
+        scale=args.pos_weight_scale,
+    )
 
     model = build_mlp(input_dim=input_dim, hidden_dim=args.hidden_dim, dropout=args.dropout).to(device)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -215,6 +259,10 @@ def main() -> None:
             "threshold": DEFAULT_THRESHOLD,
             "threshold_sweep": list(DEFAULT_THRESHOLD_SWEEP),
             "device": str(device),
+            "sampling_mode": args.sampling_mode,
+            "selection_metric": DEFAULT_SELECTION_METRIC,
+            "raw_pos_weight": float(raw_pos_weight),
+            "pos_weight_scale": float(args.pos_weight_scale),
             "pos_weight": float(pos_weight.item()),
         },
         "data_summary": {
@@ -224,9 +272,11 @@ def main() -> None:
         "epochs": [],
         "best_epoch": None,
         "best_validation_loss": None,
+        "best_selection_metric": None,
     }
 
     best_validation_loss = float("inf")
+    best_selection_metric = float("-inf")
     for epoch_index in range(args.epochs):
         train_loss = run_training_epoch(
             model=model,
@@ -237,6 +287,7 @@ def main() -> None:
             device=device,
             epoch_index=epoch_index,
             seed=args.seed,
+            sampling_mode=args.sampling_mode,
         )
         validation_metrics = evaluate_model(
             model=model,
@@ -254,6 +305,8 @@ def main() -> None:
             thresholds=DEFAULT_THRESHOLD_SWEEP,
         )
         default_metrics = validation_report["default_threshold_metrics"]
+        selected_threshold_metrics = validation_report["selected_threshold"]
+        selection_score = float(selected_threshold_metrics["f1"]) if selected_threshold_metrics is not None else 0.0
 
         epoch_record = {
             "epoch": epoch_index + 1,
@@ -277,13 +330,27 @@ def main() -> None:
             "negative_probability_p10": default_metrics["negative_probability_p10"],
             "negative_probability_p50": default_metrics["negative_probability_p50"],
             "negative_probability_p90": default_metrics["negative_probability_p90"],
+            "selected_threshold": selected_threshold_metrics["threshold"] if selected_threshold_metrics is not None else None,
+            "selected_threshold_f1": selection_score,
+            "selected_threshold_precision": selected_threshold_metrics["precision"] if selected_threshold_metrics is not None else None,
+            "selected_threshold_recall": selected_threshold_metrics["recall"] if selected_threshold_metrics is not None else None,
         }
         history["epochs"].append(epoch_record)
 
-        if float(validation_metrics["validation_loss"]) < best_validation_loss:
+        checkpoint_improved = False
+        if (
+            selection_score > best_selection_metric
+            or (
+                selection_score == best_selection_metric
+                and float(validation_metrics["validation_loss"]) < best_validation_loss
+            )
+        ):
+            checkpoint_improved = True
+            best_selection_metric = selection_score
             best_validation_loss = float(validation_metrics["validation_loss"])
             history["best_epoch"] = epoch_index + 1
             history["best_validation_loss"] = best_validation_loss
+            history["best_selection_metric"] = best_selection_metric
             save_model_checkpoint(
                 model,
                 args.model_path,
@@ -318,7 +385,11 @@ def main() -> None:
             f"val_rec={default_metrics['recall']:.4f} "
             f"val_f1={default_metrics['f1']:.4f} "
             f"val_ap={default_metrics['average_precision']:.4f} "
-            f"pos_rate={default_metrics['positive_prediction_rate']:.4f}"
+            f"pos_rate={default_metrics['positive_prediction_rate']:.4f} "
+            f"selected_thr={selected_threshold_metrics['threshold'] if selected_threshold_metrics is not None else 'none'} "
+            f"selected_f1={selection_score:.4f} "
+            f"checkpoint_rule={DEFAULT_SELECTION_METRIC} "
+            f"checkpoint_saved={checkpoint_improved}"
         )
 
     args.history_path.parent.mkdir(parents=True, exist_ok=True)

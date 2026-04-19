@@ -75,6 +75,21 @@ def extract_pixel_features(normalized_embedding: np.ndarray) -> np.ndarray:
     return features.astype(np.float32, copy=False)
 
 
+def extract_temporal_pixel_features(
+    normalized_baseline_embedding: np.ndarray,
+    normalized_current_embedding: np.ndarray,
+) -> np.ndarray:
+    """Return baseline, current, and delta embedding features for each pixel."""
+    baseline_features = np.moveaxis(normalized_baseline_embedding, 0, -1)
+    current_features = np.moveaxis(normalized_current_embedding, 0, -1)
+    delta_features = current_features - baseline_features
+    features = np.concatenate((baseline_features, current_features, delta_features), axis=-1)
+
+    # Extension point: local spatial embedding features such as 3x3 mean/std can be
+    # concatenated here later without changing the temporal feature layout.
+    return features.astype(np.float32, copy=False)
+
+
 def save_normalization_statistics(
     output_path: Path,
     *,

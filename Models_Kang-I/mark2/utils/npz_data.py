@@ -76,6 +76,48 @@ def iterate_training_batches(
             yield features[start:end], labels[start:end]
 
 
+def iterate_balanced_training_batches(
+    directory: Path,
+    batch_size: int,
+    epoch_seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Yield deterministic class-balanced mini-batches for one epoch."""
+    rng = np.random.default_rng(epoch_seed)
+    file_paths = list_npz_files(directory)
+    if not file_paths:
+        raise FileNotFoundError(f"No .npz files found in {directory}")
+
+    file_order = rng.permutation(len(file_paths))
+    for file_index in file_order:
+        features, labels = flatten_valid_pixels(file_paths[int(file_index)])
+        if labels.size == 0:
+            continue
+
+        positive_indices = np.flatnonzero(labels == 1)
+        negative_indices = np.flatnonzero(labels == 0)
+        if positive_indices.size == 0 or negative_indices.size == 0:
+            pixel_order = rng.permutation(labels.shape[0])
+            features_shuffled = features[pixel_order]
+            labels_shuffled = labels[pixel_order]
+            for start in range(0, labels_shuffled.shape[0], batch_size):
+                end = start + batch_size
+                yield features_shuffled[start:end], labels_shuffled[start:end]
+            continue
+
+        target_count = max(positive_indices.size, negative_indices.size)
+        sampled_positive = rng.choice(positive_indices, size=target_count, replace=positive_indices.size < target_count)
+        sampled_negative = rng.choice(negative_indices, size=target_count, replace=negative_indices.size < target_count)
+        balanced_indices = np.concatenate((sampled_positive, sampled_negative))
+        balanced_order = rng.permutation(balanced_indices.shape[0])
+        balanced_indices = balanced_indices[balanced_order]
+
+        balanced_features = features[balanced_indices]
+        balanced_labels = labels[balanced_indices]
+        for start in range(0, balanced_labels.shape[0], batch_size):
+            end = start + batch_size
+            yield balanced_features[start:end], balanced_labels[start:end]
+
+
 def iterate_eval_batches(directory: Path, batch_size: int) -> tuple[np.ndarray, np.ndarray]:
     """Yield deterministic evaluation batches from a split of `.npz` files."""
     file_paths = list_npz_files(directory)

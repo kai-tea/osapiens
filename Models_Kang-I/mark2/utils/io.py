@@ -41,6 +41,17 @@ def available_years_by_split(data_root: Path, split: str) -> dict[str, set[int]]
     return years_by_tile
 
 
+def choose_baseline_year(available_years: set[int] | None, current_year: int) -> int:
+    """Pick the latest year before the current year, or fall back to the current year."""
+    if not available_years:
+        return current_year
+
+    earlier_years = sorted(year for year in available_years if year < current_year)
+    if earlier_years:
+        return earlier_years[-1]
+    return current_year
+
+
 def infer_latest_common_year(data_root: Path, splits: tuple[str, ...] = ("train", "test")) -> int:
     """Infer the latest embedding year shared by every tile in the requested splits."""
     common_years: set[int] | None = None

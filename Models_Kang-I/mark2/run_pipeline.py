@@ -80,6 +80,16 @@ def main() -> None:
                 f"negative_ignored={gating_summary['negative_ignored_outside_forest']} "
                 f"average_forest_fraction={gating_summary['average_forest_fraction']}"
             )
+        temporal_summary = summary.get("temporal_feature_summaries", {}).get(split_name)
+        if temporal_summary is not None:
+            print(
+                f"{split_name} temporal features: "
+                f"current_year={temporal_summary['current_year']} "
+                f"baseline_years_used={temporal_summary['baseline_years_used']} "
+                f"same_year_fallback_tiles={temporal_summary['same_year_fallback_tiles']} "
+                f"input_dim_before={temporal_summary['input_dim_before']} "
+                f"input_dim_after={temporal_summary['input_dim_after']}"
+            )
 
 
 if __name__ == "__main__":
