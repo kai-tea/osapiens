@@ -1,4 +1,4 @@
-"""Apply a JRC forest mask to existing binary prediction rasters and export submission GeoJSON."""
+"""Apply a JRC forest mask to existing binary prediction rasters and export one merged submission GeoJSON."""
 
 from __future__ import annotations
 
@@ -22,6 +22,9 @@ DEFAULT_INPUT_PREDICTION_DIR = Path("~/osapiens/artifacts/predictions_autoloop/a
 DEFAULT_JRC_DIR = Path("~/jrc_gfc2020").expanduser()
 DEFAULT_OUTPUT_MASKED_DIR = Path("~/osapiens/artifacts/predictions_autoloop/autoloop_recall_jrc").expanduser()
 DEFAULT_OUTPUT_SUBMISSION_DIR = Path("~/osapiens/artifacts/submission/autoloop_recall_jrc").expanduser()
+DEFAULT_MERGED_OUTPUT_PATH = (
+    Path("~/osapiens/artifacts/submission/autoloop_recall_jrc/submission_autoloop_recall_jrc.geojson").expanduser()
+)
 DEFAULT_MIN_AREA_HA = 0.5
 DEFAULT_TOP_VALUE_COUNT = 10
 
@@ -282,6 +285,7 @@ def export_tile_submission(masked_raster: Path, output_geojson: Path, min_area_h
         export_mode = "empty_feature_collection"
 
     return {
+        "geojson": geojson,
         "geojson_path": str(output_geojson),
         "polygon_count": len(geojson.get("features", [])),
         "min_area_ha": min_area_ha,
@@ -296,6 +300,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jrc_dir", type=Path, default=DEFAULT_JRC_DIR)
     parser.add_argument("--output_masked_dir", type=Path, default=DEFAULT_OUTPUT_MASKED_DIR)
     parser.add_argument("--output_submission_dir", type=Path, default=DEFAULT_OUTPUT_SUBMISSION_DIR)
+    parser.add_argument("--merged_output_path", type=Path, default=DEFAULT_MERGED_OUTPUT_PATH)
     parser.add_argument(
         "--forest_values",
         type=str,
@@ -324,6 +329,7 @@ def main() -> None:
     jrc_dir = args.jrc_dir.expanduser()
     output_masked_dir = args.output_masked_dir.expanduser()
     output_submission_dir = args.output_submission_dir.expanduser()
+    merged_output_path = args.merged_output_path.expanduser()
     forest_values = parse_forest_values(args.forest_values)
     forest_min_value = args.forest_min_value
 
@@ -343,9 +349,11 @@ def main() -> None:
 
     output_masked_dir.mkdir(parents=True, exist_ok=True)
     output_submission_dir.mkdir(parents=True, exist_ok=True)
+    merged_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     manifest_rows: list[dict[str, object]] = []
     inspection_rows: list[dict[str, object]] = []
+    merged_features: list[dict[str, object]] = []
 
     with tempfile.TemporaryDirectory(prefix="mark2_jrc_mask_") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
@@ -392,11 +400,14 @@ def main() -> None:
                 f"removed_positive_pixels={removed_positive_pixels}"
             )
 
+            intermediate_geojson_path = output_submission_dir / "per_tile_geojson" / f"pred_{tile_id}.geojson"
             submission_result = export_tile_submission(
                 masked_raster=masked_raster,
-                output_geojson=output_submission_dir / f"pred_{tile_id}.geojson",
+                output_geojson=intermediate_geojson_path,
                 min_area_ha=args.min_area_ha,
             )
+            merged_features.extend(submission_result["geojson"].get("features", []))
+
             manifest_rows.append(
                 {
                     "tile_id": tile_id,
@@ -408,7 +419,10 @@ def main() -> None:
                     "forest_values": forest_values if forest_values else None,
                     "forest_min_value": forest_min_value,
                     "jrc_summary": summary,
-                    **submission_result,
+                    "geojson_path": submission_result["geojson_path"],
+                    "polygon_count": submission_result["polygon_count"],
+                    "min_area_ha": submission_result["min_area_ha"],
+                    "export_mode": submission_result["export_mode"],
                 }
             )
 
@@ -421,13 +435,11 @@ def main() -> None:
         f"top={format_top_values(global_summary['top_values'])}"
     )
 
+    merged_geojson = {"type": "FeatureCollection", "features": merged_features}
+    if not args.inspect_only:
+        merged_output_path.write_text(json.dumps(merged_geojson))
+
     manifest_path = output_submission_dir / "jrc_mask_manifest.json"
-    sanitized_rows = []
-    for row in manifest_rows:
-        sanitized_row = dict(row)
-        if "values" in sanitized_row:
-            sanitized_row.pop("values")
-        sanitized_rows.append(sanitized_row)
     manifest_path.write_text(
         json.dumps(
             {
@@ -435,11 +447,19 @@ def main() -> None:
                 "forest_values": forest_values if forest_values else None,
                 "forest_min_value": forest_min_value,
                 "global_jrc_summary": global_summary,
-                "tiles": sanitized_rows,
+                "merged_output_path": str(merged_output_path),
+                "merged_feature_count": len(merged_features),
+                "tile_count": len(prediction_rasters),
+                "tiles": manifest_rows,
             },
             indent=2,
         )
     )
+
+    if not args.inspect_only:
+        print(f"merged_output_path={merged_output_path}")
+        print(f"total_feature_count={len(merged_features)}")
+        print(f"tile_count={len(prediction_rasters)}")
     print(f"saved {manifest_path}")
 
 
