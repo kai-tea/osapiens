@@ -66,6 +66,20 @@ def main() -> None:
             f"negative={counts['negative']} "
             f"uncertain={counts['uncertain']}"
         )
+        gating_summary = summary.get("label_gating_summaries", {}).get(split_name)
+        if gating_summary is not None:
+            print(
+                f"{split_name} JRC gating: "
+                f"tiles_with_jrc={gating_summary['tiles_with_jrc']} "
+                f"tiles_without_jrc={gating_summary['tiles_without_jrc']} "
+                f"positive_before={gating_summary['positive_before']} "
+                f"positive_after={gating_summary['positive_after']} "
+                f"negative_before={gating_summary['negative_before']} "
+                f"negative_after={gating_summary['negative_after']} "
+                f"positive_suppressed={gating_summary['positive_suppressed_outside_forest']} "
+                f"negative_ignored={gating_summary['negative_ignored_outside_forest']} "
+                f"average_forest_fraction={gating_summary['average_forest_fraction']}"
+            )
 
 
 if __name__ == "__main__":
