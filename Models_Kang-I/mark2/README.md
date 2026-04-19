@@ -13,6 +13,8 @@ Version 1 intentionally keeps the pipeline conservative:
 
 ```text
 Models_Kang-I/mark2/
+├── evaluation/
+│   └── report_predictions.py
 ├── inference/
 │   └── predict_mlp.py
 ├── labels/
@@ -21,11 +23,16 @@ Models_Kang-I/mark2/
 │   └── mlp.py
 ├── preprocessing/
 │   └── embeddings.py
+├── submission/
+│   └── generate_submission.py
 ├── training/
 │   └── train_mlp.py
 ├── utils/
 │   ├── io.py
-│   └── npz_data.py
+│   ├── evaluation.py
+│   ├── npz_data.py
+│   ├── prediction.py
+│   └── raster.py
 ├── pipeline.py
 ├── run_pipeline.py
 └── README.md
@@ -121,13 +128,15 @@ Training setup:
 - each tile is flattened into pixel rows
 - only `valid_mask == True` pixels are used
 - uncertain weak labels are ignored
-- loss is `BCEWithLogitsLoss`
+- loss is weighted `BCEWithLogitsLoss`
 - optimizer is `Adam`
 
 Saved outputs:
 
 - best checkpoint: `Models_Kang-I/mark2/outputs/models/mlp_best.pt`
 - training history: `Models_Kang-I/mark2/outputs/models/mlp_history.json`
+- validation prediction tiles: `Models_Kang-I/mark2/outputs/predictions/mlp_validation/`
+- validation report with threshold sweep: `Models_Kang-I/mark2/outputs/models/mlp_validation_report.json`
 
 How to train:
 
@@ -142,3 +151,99 @@ python3 Models_Kang-I/mark2/inference/predict_mlp.py
 ```
 
 Prediction outputs are saved as `.npz` files with dense probability maps and, if requested, thresholded binary maps.
+
+## Improved Mark 2 Workflow
+
+The current `mark2` training and inference path is still intentionally simple, but it adds a few practical pieces to make the baseline more usable:
+
+- positive class weighting with `pos_weight = negative_count / positive_count`
+- richer validation metrics including confusion counts, F1, average precision, and probability summaries
+- a fixed validation threshold sweep with automatic threshold selection by best F1
+- saved validation prediction artifacts so reporting can be rerun without recomputing model outputs
+- a direct test-to-submission export path
+
+### Training Outputs
+
+`train_mlp.py` now saves:
+
+- `mlp_best.pt`: best checkpoint by validation loss
+- `mlp_history.json`: config, split counts, `pos_weight`, and per-epoch metrics
+- `mlp_validation_report.json`: validation metrics plus threshold sweep and selected threshold
+- validation prediction `.npz` files under `outputs/predictions/mlp_validation/`
+
+The validation report includes:
+
+- loss
+- accuracy
+- precision
+- recall
+- F1
+- average precision
+- positive prediction rate
+- confusion matrix counts
+- probability summaries for positive and negative labels
+- threshold sweep results
+- selected threshold
+
+### Example Commands
+
+Run training from the repository root:
+
+```bash
+python3 Models_Kang-I/mark2/training/train_mlp.py
+```
+
+Regenerate a validation report from saved validation prediction outputs:
+
+```bash
+python3 Models_Kang-I/mark2/evaluation/report_predictions.py \
+  --input_dir Models_Kang-I/mark2/outputs/predictions/mlp_validation \
+  --output_path Models_Kang-I/mark2/outputs/models/mlp_validation_report.json
+```
+
+Run validation inference with the tuned threshold from the saved report:
+
+```bash
+python3 Models_Kang-I/mark2/inference/predict_mlp.py \
+  --input_dir Models_Kang-I/mark2/outputs/baseline_v1/validation \
+  --model_path Models_Kang-I/mark2/outputs/models/mlp_best.pt \
+  --output_dir Models_Kang-I/mark2/outputs/predictions/mlp_validation_thresholded \
+  --threshold_report Models_Kang-I/mark2/outputs/models/mlp_validation_report.json \
+  --save_binary
+```
+
+Run test inference:
+
+```bash
+python3 Models_Kang-I/mark2/inference/predict_mlp.py \
+  --input_dir Models_Kang-I/mark2/outputs/baseline_v1/test \
+  --model_path Models_Kang-I/mark2/outputs/models/mlp_best.pt \
+  --output_dir Models_Kang-I/mark2/outputs/predictions/mlp_test
+```
+
+Generate challenge submission files from saved test probabilities:
+
+```bash
+python3 Models_Kang-I/mark2/submission/generate_submission.py \
+  --data_root data/makeathon-challenge \
+  --input_dir Models_Kang-I/mark2/outputs/predictions/mlp_test \
+  --output_dir Models_Kang-I/mark2/outputs/submission/mlp_test \
+  --threshold_report Models_Kang-I/mark2/outputs/models/mlp_validation_report.json
+```
+
+### Submission Assumption
+
+This submission path follows the repository’s existing challenge convention:
+
+- predictions are converted into per-tile binary rasters
+- each tile is polygonized into `pred_<tile_id>.geojson`
+- polygon conversion uses the shared challenge helper `submission_utils.py`
+
+If you want test inference, remember to create the `baseline_v1/test/` preprocessing outputs first by running:
+
+```bash
+python3 Models_Kang-I/mark2/run_pipeline.py \
+  --data_root data/makeathon-challenge \
+  --output_dir Models_Kang-I/mark2/outputs/baseline_v1 \
+  --include_test
+```

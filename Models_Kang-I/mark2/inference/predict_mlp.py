@@ -6,7 +6,6 @@ import argparse
 from pathlib import Path
 import sys
 
-import numpy as np
 import torch
 
 if __package__ in {None, ""}:
@@ -14,10 +13,10 @@ if __package__ in {None, ""}:
 
 try:
     from ..models.mlp import load_model_checkpoint
-    from ..utils.npz_data import iter_prediction_inputs
+    from ..utils.prediction import load_selected_threshold, save_prediction_set
 except ImportError:
     from models.mlp import load_model_checkpoint
-    from utils.npz_data import iter_prediction_inputs
+    from utils.prediction import load_selected_threshold, save_prediction_set
 
 
 DEFAULT_INPUT_DIR = Path("Models_Kang-I/mark2/outputs/baseline_v1/validation")
@@ -32,28 +31,6 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def predict_probability_map(
-    model: torch.nn.Module,
-    features: np.ndarray,
-    batch_size: int,
-    device: torch.device,
-) -> np.ndarray:
-    """Predict a dense probability map from per-pixel features."""
-    height, width, channels = features.shape
-    flat_features = features.reshape(-1, channels).astype(np.float32, copy=False)
-    probabilities = np.empty(flat_features.shape[0], dtype=np.float32)
-
-    model.eval()
-    with torch.no_grad():
-        for start in range(0, flat_features.shape[0], batch_size):
-            end = start + batch_size
-            batch = torch.from_numpy(flat_features[start:end]).to(device=device, dtype=torch.float32)
-            logits = model(batch)
-            probabilities[start:end] = torch.sigmoid(logits).cpu().numpy()
-
-    return probabilities.reshape(height, width)
-
-
 def build_argument_parser() -> argparse.ArgumentParser:
     """Create the CLI parser for MLP prediction."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -62,6 +39,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory for prediction `.npz` outputs.")
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size used during inference.")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="Threshold for optional binary maps.")
+    parser.add_argument(
+        "--threshold_report",
+        type=Path,
+        default=None,
+        help="Optional validation report JSON from which to read the selected threshold.",
+    )
     parser.add_argument(
         "--save_binary",
         action="store_true",
@@ -75,29 +58,18 @@ def main() -> None:
     args = build_argument_parser().parse_args()
     device = get_device()
     model = load_model_checkpoint(args.model_path, map_location=device).to(device)
+    chosen_threshold = load_selected_threshold(args.threshold_report) if args.threshold_report is not None else args.threshold
 
-    # Extension point: calibration threshold tuning can be added here later.
     # Extension point: forest-map prior features can be added to the model inputs later.
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    for input_path, tile in iter_prediction_inputs(args.input_dir):
-        probabilities = predict_probability_map(
-            model=model,
-            features=tile["features"],
-            batch_size=args.batch_size,
-            device=device,
-        )
-
-        output_payload = {
-            "tile_id": tile.get("tile_id", np.array([input_path.stem])),
-            "split": tile.get("split", np.array(["unknown"])),
-            "year": tile.get("year", np.array([-1], dtype=np.int32)),
-            "probabilities": probabilities.astype(np.float32, copy=False),
-        }
-        if args.save_binary:
-            output_payload["binary_map"] = (probabilities >= args.threshold).astype(np.uint8)
-
-        output_path = args.output_dir / input_path.name
-        np.savez_compressed(output_path, **output_payload)
+    output_paths = save_prediction_set(
+        model=model,
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        batch_size=args.batch_size,
+        device=device,
+        threshold=chosen_threshold if args.save_binary else None,
+    )
+    for output_path in output_paths:
         print(f"saved {output_path}")
 
 

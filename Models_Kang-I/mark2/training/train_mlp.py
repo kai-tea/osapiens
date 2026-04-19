@@ -17,17 +17,25 @@ if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 try:
+    from ..evaluation.report_predictions import load_labels_and_probabilities
     from ..models.mlp import build_mlp, save_model_checkpoint
+    from ..utils.evaluation import DEFAULT_THRESHOLD_SWEEP, build_validation_report, save_json_report
     from ..utils.npz_data import count_split_pixels, infer_input_dim_from_npz, iterate_eval_batches, iterate_training_batches
+    from ..utils.prediction import save_prediction_set
 except ImportError:
+    from evaluation.report_predictions import load_labels_and_probabilities
     from models.mlp import build_mlp, save_model_checkpoint
+    from utils.evaluation import DEFAULT_THRESHOLD_SWEEP, build_validation_report, save_json_report
     from utils.npz_data import count_split_pixels, infer_input_dim_from_npz, iterate_eval_batches, iterate_training_batches
+    from utils.prediction import save_prediction_set
 
 
 DEFAULT_TRAIN_DIR = Path("Models_Kang-I/mark2/outputs/baseline_v1/train")
 DEFAULT_VALIDATION_DIR = Path("Models_Kang-I/mark2/outputs/baseline_v1/validation")
 DEFAULT_MODEL_PATH = Path("Models_Kang-I/mark2/outputs/models/mlp_best.pt")
 DEFAULT_HISTORY_PATH = Path("Models_Kang-I/mark2/outputs/models/mlp_history.json")
+DEFAULT_VALIDATION_PREDICTION_DIR = Path("Models_Kang-I/mark2/outputs/predictions/mlp_validation")
+DEFAULT_VALIDATION_REPORT_PATH = Path("Models_Kang-I/mark2/outputs/models/mlp_validation_report.json")
 DEFAULT_HIDDEN_DIM = 64
 DEFAULT_DROPOUT = 0.1
 DEFAULT_LR = 1e-3
@@ -51,31 +59,6 @@ def set_deterministic_seed(seed: int) -> None:
 def get_device() -> torch.device:
     """Pick the training device, preferring CUDA when available."""
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def compute_binary_metrics(logits: torch.Tensor, labels: torch.Tensor, threshold: float) -> dict[str, float]:
-    """Compute simple validation metrics from logits and binary labels."""
-    probabilities = torch.sigmoid(logits)
-    predictions = probabilities >= threshold
-    labels_bool = labels >= 0.5
-
-    true_positive = torch.count_nonzero(predictions & labels_bool).item()
-    true_negative = torch.count_nonzero((~predictions) & (~labels_bool)).item()
-    false_positive = torch.count_nonzero(predictions & (~labels_bool)).item()
-    false_negative = torch.count_nonzero((~predictions) & labels_bool).item()
-    total = labels.numel()
-
-    accuracy = (true_positive + true_negative) / total if total else 0.0
-    precision = true_positive / (true_positive + false_positive) if (true_positive + false_positive) else 0.0
-    recall = true_positive / (true_positive + false_negative) if (true_positive + false_negative) else 0.0
-    positive_rate = predictions.float().mean().item() if total else 0.0
-
-    return {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "positive_prediction_rate": positive_rate,
-    }
 
 
 def run_training_epoch(
@@ -117,13 +100,13 @@ def evaluate_model(
     batch_size: int,
     device: torch.device,
     threshold: float,
-) -> dict[str, float]:
-    """Evaluate loss and binary metrics on the validation split."""
+) -> dict[str, object]:
+    """Evaluate loss and return raw validation probabilities for later reporting."""
     model.eval()
     total_loss = 0.0
     total_examples = 0
-    all_logits: list[torch.Tensor] = []
-    all_labels: list[torch.Tensor] = []
+    all_probabilities: list[np.ndarray] = []
+    all_labels: list[np.ndarray] = []
 
     with torch.no_grad():
         for features_np, labels_np in iterate_eval_batches(validation_dir, batch_size=batch_size):
@@ -131,25 +114,39 @@ def evaluate_model(
             labels = torch.from_numpy(labels_np).to(device=device, dtype=torch.float32)
             logits = model(features)
             loss = loss_fn(logits, labels)
+            probabilities = torch.sigmoid(logits)
 
             batch_size_actual = labels.shape[0]
             total_loss += loss.item() * batch_size_actual
             total_examples += batch_size_actual
-            all_logits.append(logits.cpu())
-            all_labels.append(labels.cpu())
+            all_probabilities.append(probabilities.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
 
     validation_loss = total_loss / total_examples if total_examples else 0.0
     if not all_labels:
-        metrics = {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "positive_prediction_rate": 0.0}
-    else:
-        metrics = compute_binary_metrics(
-            logits=torch.cat(all_logits, dim=0),
-            labels=torch.cat(all_labels, dim=0),
-            threshold=threshold,
-        )
+        return {
+            "validation_loss": validation_loss,
+            "labels": np.array([], dtype=np.int64),
+            "probabilities": np.array([], dtype=np.float32),
+        }
 
-    metrics["validation_loss"] = validation_loss
-    return metrics
+    return {
+        "validation_loss": validation_loss,
+        "labels": np.concatenate(all_labels).astype(np.int64, copy=False),
+        "probabilities": np.concatenate(all_probabilities).astype(np.float32, copy=False),
+        "default_threshold": threshold,
+    }
+
+
+def compute_positive_class_weight(train_counts: dict[str, int], device: torch.device) -> torch.Tensor:
+    """Compute the positive class weight from split counts for weighted BCE."""
+    positive_count = int(train_counts["positive"])
+    negative_count = int(train_counts["negative"])
+    if positive_count <= 0:
+        raise ValueError("Training split contains zero positive pixels; cannot compute pos_weight")
+    if negative_count <= 0:
+        raise ValueError("Training split contains zero negative pixels; cannot compute pos_weight")
+    return torch.tensor([negative_count / positive_count], dtype=torch.float32, device=device)
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -164,6 +161,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model_path", type=Path, default=DEFAULT_MODEL_PATH, help="Path for the best model checkpoint.")
     parser.add_argument("--history_path", type=Path, default=DEFAULT_HISTORY_PATH, help="Path for the JSON training history.")
+    parser.add_argument(
+        "--validation_prediction_dir",
+        type=Path,
+        default=DEFAULT_VALIDATION_PREDICTION_DIR,
+        help="Directory where best-model validation prediction `.npz` files will be saved.",
+    )
+    parser.add_argument(
+        "--validation_report_path",
+        type=Path,
+        default=DEFAULT_VALIDATION_REPORT_PATH,
+        help="Path for the best-model validation report JSON.",
+    )
     parser.add_argument("--hidden_dim", type=int, default=DEFAULT_HIDDEN_DIM, help="MLP hidden dimension.")
     parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT, help="Dropout rate in the first hidden block.")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR, help="Adam learning rate.")
@@ -182,11 +191,11 @@ def main() -> None:
     input_dim = infer_input_dim_from_npz(args.train_dir)
     train_counts = count_split_pixels(args.train_dir)
     validation_counts = count_split_pixels(args.validation_dir)
+    pos_weight = compute_positive_class_weight(train_counts, device=device)
 
     model = build_mlp(input_dim=input_dim, hidden_dim=args.hidden_dim, dropout=args.dropout).to(device)
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    # Extension point: class weighting for imbalance can be added to BCE here later.
     # Extension point: focal loss can replace BCE here later.
     optimizer = Adam(model.parameters(), lr=args.lr)
 
@@ -204,7 +213,9 @@ def main() -> None:
             "epochs": args.epochs,
             "seed": args.seed,
             "threshold": DEFAULT_THRESHOLD,
+            "threshold_sweep": list(DEFAULT_THRESHOLD_SWEEP),
             "device": str(device),
+            "pos_weight": float(pos_weight.item()),
         },
         "data_summary": {
             "train": train_counts,
@@ -235,20 +246,42 @@ def main() -> None:
             device=device,
             threshold=DEFAULT_THRESHOLD,
         )
+        validation_report = build_validation_report(
+            labels=validation_metrics["labels"],
+            probabilities=validation_metrics["probabilities"],
+            validation_loss=float(validation_metrics["validation_loss"]),
+            default_threshold=DEFAULT_THRESHOLD,
+            thresholds=DEFAULT_THRESHOLD_SWEEP,
+        )
+        default_metrics = validation_report["default_threshold_metrics"]
 
         epoch_record = {
             "epoch": epoch_index + 1,
             "train_loss": train_loss,
-            "validation_loss": validation_metrics["validation_loss"],
-            "validation_accuracy": validation_metrics["accuracy"],
-            "validation_precision": validation_metrics["precision"],
-            "validation_recall": validation_metrics["recall"],
-            "positive_prediction_rate": validation_metrics["positive_prediction_rate"],
+            "validation_loss": float(validation_metrics["validation_loss"]),
+            "validation_accuracy": default_metrics["accuracy"],
+            "validation_precision": default_metrics["precision"],
+            "validation_recall": default_metrics["recall"],
+            "validation_f1": default_metrics["f1"],
+            "validation_average_precision": default_metrics["average_precision"],
+            "positive_prediction_rate": default_metrics["positive_prediction_rate"],
+            "true_positive": default_metrics["true_positive"],
+            "true_negative": default_metrics["true_negative"],
+            "false_positive": default_metrics["false_positive"],
+            "false_negative": default_metrics["false_negative"],
+            "positive_probability_mean": default_metrics["positive_probability_mean"],
+            "negative_probability_mean": default_metrics["negative_probability_mean"],
+            "positive_probability_p10": default_metrics["positive_probability_p10"],
+            "positive_probability_p50": default_metrics["positive_probability_p50"],
+            "positive_probability_p90": default_metrics["positive_probability_p90"],
+            "negative_probability_p10": default_metrics["negative_probability_p10"],
+            "negative_probability_p50": default_metrics["negative_probability_p50"],
+            "negative_probability_p90": default_metrics["negative_probability_p90"],
         }
         history["epochs"].append(epoch_record)
 
-        if validation_metrics["validation_loss"] < best_validation_loss:
-            best_validation_loss = validation_metrics["validation_loss"]
+        if float(validation_metrics["validation_loss"]) < best_validation_loss:
+            best_validation_loss = float(validation_metrics["validation_loss"])
             history["best_epoch"] = epoch_index + 1
             history["best_validation_loss"] = best_validation_loss
             save_model_checkpoint(
@@ -258,15 +291,34 @@ def main() -> None:
                 hidden_dim=args.hidden_dim,
                 dropout=args.dropout,
             )
+            save_prediction_set(
+                model=model,
+                input_dir=args.validation_dir,
+                output_dir=args.validation_prediction_dir,
+                batch_size=args.batch_size,
+                device=device,
+                threshold=None,
+            )
+            saved_labels, saved_probabilities = load_labels_and_probabilities(args.validation_prediction_dir)
+            saved_report = build_validation_report(
+                labels=saved_labels,
+                probabilities=saved_probabilities,
+                validation_loss=best_validation_loss,
+                default_threshold=DEFAULT_THRESHOLD,
+                thresholds=DEFAULT_THRESHOLD_SWEEP,
+            )
+            save_json_report(saved_report, args.validation_report_path)
 
         print(
             f"epoch={epoch_index + 1} "
             f"train_loss={train_loss:.6f} "
-            f"val_loss={validation_metrics['validation_loss']:.6f} "
-            f"val_acc={validation_metrics['accuracy']:.4f} "
-            f"val_prec={validation_metrics['precision']:.4f} "
-            f"val_rec={validation_metrics['recall']:.4f} "
-            f"pos_rate={validation_metrics['positive_prediction_rate']:.4f}"
+            f"val_loss={float(validation_metrics['validation_loss']):.6f} "
+            f"val_acc={default_metrics['accuracy']:.4f} "
+            f"val_prec={default_metrics['precision']:.4f} "
+            f"val_rec={default_metrics['recall']:.4f} "
+            f"val_f1={default_metrics['f1']:.4f} "
+            f"val_ap={default_metrics['average_precision']:.4f} "
+            f"pos_rate={default_metrics['positive_prediction_rate']:.4f}"
         )
 
     args.history_path.parent.mkdir(parents=True, exist_ok=True)
